@@ -1,0 +1,621 @@
+import { buildProgramGraph } from "./graph";
+import { parseProgram } from "./parser";
+import type { Expr, FunctionAst, RunResult, RuntimeError, Stmt, TraceSnapshot } from "./types";
+
+const STEP_LIMIT = 5_000;
+const CALL_LIMIT = 200;
+const inputStream = Symbol("cin");
+const outputStream = Symbol("cout");
+const endLine = Symbol("endl");
+const uninitialized = Symbol("uninitialized");
+
+type Frame = {
+  fn: FunctionAst;
+  vars: Map<string, unknown>;
+  types: Map<string, string>;
+  scopes: Array<{ vars: Map<string, unknown>; types: Map<string, string> }>;
+};
+
+type Location =
+  | { kind: "variable"; vars: Map<string, unknown>; name: string }
+  | { kind: "cell"; array: unknown[]; index: number; name: string };
+
+class RuntimeFault extends Error {
+  constructor(message: string, readonly line: number) {
+    super(message);
+    this.name = "RuntimeFault";
+  }
+}
+
+class FlowSignal {
+  constructor(readonly type: "return" | "break" | "continue", readonly value?: unknown) {}
+}
+
+export function runProgram(source: string, stdin: string): RunResult {
+  const parsed = parseProgram(source);
+  const snapshots: TraceSnapshot[] = [];
+  const output: string[] = [];
+  let error: RuntimeError | undefined;
+  let stepCount = 0;
+  const functions = new Map(parsed.functions.map((fn) => [fn.name, fn]));
+  const main = functions.get("main");
+  const frames: Frame[] = [];
+  const tokens = stdin.split(/\s+/).filter(Boolean);
+  let inputIndex = 0;
+  let returned: unknown;
+  const reads = new Set<string>();
+  const changes = new Set<string>();
+  const graphs = buildProgramGraph(source).functions;
+  const graphByFunction = new Map(graphs.map((graph) => [graph.name, graph]));
+
+  const currentFrame = () => frames.at(-1);
+  const resolveVariable = (name: string) => {
+    for (let frameIndex = frames.length - 1; frameIndex >= 0; frameIndex -= 1) {
+      const frame = frames[frameIndex]!;
+      for (let scopeIndex = frame.scopes.length - 1; scopeIndex >= 0; scopeIndex -= 1) {
+        const scope = frame.scopes[scopeIndex]!;
+        if (scope.vars.has(name)) return { frame, vars: scope.vars, types: scope.types };
+      }
+      if (frame.vars.has(name)) return { frame, vars: frame.vars, types: frame.types };
+    }
+    return undefined;
+  };
+  const typeOfVariable = (name: string) => resolveVariable(name)?.types.get(name);
+  const currentVariables = () => {
+    const result: Record<string, unknown> = {};
+    for (const frame of frames) {
+      for (const [name, value] of visibleVariables(frame)) {
+        const key = frames.filter((candidate) => visibleVariables(candidate).has(name)).length > 1
+          ? `${frame.fn.name}.${name}`
+          : name;
+        result[key] = clone(value);
+      }
+    }
+    return result;
+  };
+  const frameVariables = () => Object.fromEntries(frames.map((frame, index) => {
+    const name = `${frame.fn.name}${frames.slice(0, index).filter((previous) => previous.fn.name === frame.fn.name).length ? ` #${frames.slice(0, index).filter((previous) => previous.fn.name === frame.fn.name).length + 1}` : ""}`;
+    return [name, Object.fromEntries([...visibleVariables(frame)].map(([key, value]) => [key, clone(value)]))];
+  }));
+  const nodeForLine = (line: number) => {
+    const fn = currentFrame()?.fn.name ?? "main";
+    const nodes = graphByFunction.get(fn)?.nodes ?? [];
+    const exact = nodes.find((node) => node.lines?.includes(line) || node.line === line);
+    const nearby = exact ?? nodes
+      .filter((node) => node.line <= line && node.kind !== "start" && node.kind !== "end")
+      .sort((a, b) => b.line - a.line)[0];
+    return nearby?.id ?? `${fn}:start`;
+  };
+  const record = (line: number) => {
+    stepCount += 1;
+    if (stepCount > STEP_LIMIT) throw new RuntimeFault("Possible infinite loop: execution stopped after 5,000 steps.", line);
+    snapshots.push({
+      line,
+      nodeId: nodeForLine(line),
+      variables: currentVariables(),
+      frames: frames.map((frame) => frame.fn.name),
+      frameVariables: frameVariables(),
+      output: output.join(""),
+      changes: [...changes],
+      reads: [...reads],
+    });
+    changes.clear();
+    reads.clear();
+  };
+  const fault = (message: string, line: number): never => {
+    throw new RuntimeFault(message, line);
+  };
+
+  const execute = (statement: Stmt): void => {
+    switch (statement.kind) {
+      case "block": {
+        const frame = currentFrame();
+        if (!frame) return fault("A block is outside a function.", statement.line);
+        frame.scopes.push({ vars: new Map(), types: new Map() });
+        try {
+          for (const child of statement.body) execute(child);
+        } finally {
+          frame.scopes.pop();
+        }
+        return;
+      }
+      case "empty":
+        record(statement.line);
+        return;
+      case "unsupported":
+        return fault(`${statement.label} are not supported yet.`, statement.line);
+      case "declaration":
+        for (const declaration of statement.declarations) {
+          const frame = currentFrame();
+          if (!frame) return fault("Variable declaration is outside a function.", declaration.line);
+          const scope = currentScope(frame);
+          if (scope.vars.has(declaration.name)) return fault(`“${declaration.name}” is already declared in this scope.`, declaration.line);
+          let value: unknown = defaultValue(declaration.type);
+          if (declaration.arraySize) {
+            const size = toNumber(evaluate(declaration.arraySize));
+            if (!Number.isInteger(size) || size < 0 || size > 100_000) return fault("Array size must be a non-negative integer no greater than 100,000.", declaration.line);
+            value = Array.from({ length: size }, () => defaultValue(arrayElementType(declaration.type)));
+          }
+          if (declaration.initializer) {
+            const initial = evaluate(declaration.initializer);
+            value = Array.isArray(initial) ? clone(initial) : initial;
+          }
+          scope.vars.set(declaration.name, value);
+          scope.types.set(declaration.name, declaration.type);
+          changes.add(declaration.name);
+        }
+        record(statement.line);
+        return;
+      case "expression":
+        evaluate(statement.expression);
+        record(statement.line);
+        return;
+      case "if": {
+        const branch = truthy(evaluate(statement.condition));
+        record(statement.line);
+        if (branch) execute(statement.consequence);
+        else if (statement.alternative) execute(statement.alternative);
+        return;
+      }
+      case "while":
+        while (truthy(evaluate(statement.condition))) {
+          record(statement.line);
+          try {
+            execute(statement.body);
+          } catch (signal) {
+            if (signal instanceof FlowSignal && signal.type === "break") break;
+            if (!(signal instanceof FlowSignal && signal.type === "continue")) throw signal;
+          }
+        }
+        record(statement.line);
+        return;
+      case "do": {
+        let first = true;
+        while (first || truthy(evaluate(statement.condition))) {
+          first = false;
+          record(statement.line);
+          try {
+            execute(statement.body);
+          } catch (signal) {
+            if (signal instanceof FlowSignal && signal.type === "break") break;
+            if (!(signal instanceof FlowSignal && signal.type === "continue")) throw signal;
+          }
+        }
+        record(statement.line);
+        return;
+      }
+      case "for": {
+        if (statement.initializer) execute(statement.initializer);
+        while (statement.condition ? truthy(evaluate(statement.condition)) : true) {
+          record(statement.line);
+          try {
+            execute(statement.body);
+          } catch (signal) {
+            if (signal instanceof FlowSignal && signal.type === "break") break;
+            if (!(signal instanceof FlowSignal && signal.type === "continue")) throw signal;
+          }
+          if (statement.update) {
+            evaluate(statement.update);
+            record(statement.update.line);
+          }
+        }
+        record(statement.line);
+        return;
+      }
+      case "rangeFor": {
+        const values = evaluate(statement.iterable);
+        if (!Array.isArray(values) && typeof values !== "string") {
+          fault("A range-for loop needs an array, vector, or string.", statement.line);
+        }
+        const frame = currentFrame();
+        if (!frame) return fault("Range-for loop is outside a function.", statement.line);
+        const rangeScope = { vars: new Map<string, unknown>(), types: new Map<string, string>() };
+        frame.scopes.push(rangeScope);
+        rangeScope.types.set(statement.variable.name, statement.variable.type);
+        for (const value of values as Iterable<unknown>) {
+          rangeScope.vars.set(statement.variable.name, value);
+          changes.add(statement.variable.name);
+          record(statement.line);
+          try {
+            execute(statement.body);
+          } catch (signal) {
+            if (signal instanceof FlowSignal && signal.type === "break") break;
+            if (!(signal instanceof FlowSignal && signal.type === "continue")) throw signal;
+          }
+        }
+        frame.scopes.pop();
+        record(statement.line);
+        return;
+      }
+      case "return":
+        returned = statement.value ? evaluate(statement.value) : undefined;
+        record(statement.line);
+        throw new FlowSignal("return", returned);
+      case "break":
+      case "continue":
+        record(statement.line);
+        throw new FlowSignal(statement.kind);
+    }
+  };
+
+  const evaluate = (expression: Expr): unknown => {
+    switch (expression.kind) {
+      case "literal":
+        return expression.value;
+      case "unsupported":
+        return fault(`${expression.label} are not supported yet.`, expression.line);
+      case "identifier": {
+        if (expression.name === "cin") return inputStream;
+        if (expression.name === "cout") return outputStream;
+        if (expression.name === "endl") return endLine;
+        if (expression.name === "true") return true;
+        if (expression.name === "false") return false;
+        const resolved = resolveVariable(expression.name);
+        const frame = resolved?.frame;
+        if (!frame) return fault(`“${expression.name}” is not defined.`, expression.line);
+        reads.add(expression.name);
+        const value = resolved!.vars.get(expression.name);
+        if (value === uninitialized) fault(`“${expression.name}” is used before it is initialized.`, expression.line);
+        return value;
+      }
+      case "list":
+        return expression.values.map(evaluate);
+      case "index": {
+        const object = evaluate(expression.object);
+        const index = evaluate(expression.index);
+        const numeric = toNumber(index);
+        if (!Number.isInteger(numeric)) fault("An array index must be an integer.", expression.line);
+        if (!Array.isArray(object) && typeof object !== "string") return fault("Only arrays, vectors, and strings can be indexed.", expression.line);
+        if (numeric < 0 || numeric >= object.length) fault(`Index ${numeric} is out of bounds for length ${object.length}.`, expression.line);
+        reads.add(`${expressionText(expression.object)}[${numeric}]`);
+        return object[numeric];
+      }
+      case "member": {
+        const object = evaluate(expression.object);
+        if (expression.property === "size" && Array.isArray(object)) return object.length;
+        if (expression.property === "length" && typeof object === "string") return object.length;
+        return (object as Record<string, unknown> | null)?.[expression.property];
+      }
+      case "unary": {
+        const value = evaluate(expression.argument);
+        switch (expression.operator) {
+          case "!": return !truthy(value);
+          case "-": return -toNumber(value);
+          case "+": return toNumber(value);
+          case "~": return ~toNumber(value);
+          case "*":
+          case "&":
+            return fault("Pointer and reference operators are not supported yet.", expression.line);
+          default:
+            return fault(`Unary operator “${expression.operator}” is not supported yet.`, expression.line);
+        }
+      }
+      case "update": {
+        const location = getLocation(expression.argument, expression.line);
+        const oldValue = readLocation(location, expression.line);
+        const next = toNumber(oldValue) + (expression.operator === "++" ? 1 : -1);
+        writeLocation(location, next);
+        return expression.prefix ? next : oldValue;
+      }
+      case "assignment": {
+        const location = getLocation(expression.left, expression.line);
+        const right = evaluate(expression.right);
+        const previous = expression.operator === "=" ? undefined : readLocation(location, expression.line);
+        const value = expression.operator === "="
+          ? right
+          : applyOperator(expression.operator.slice(0, -1), previous, right, expression.line);
+        writeLocation(location, value);
+        return value;
+      }
+      case "binary": {
+        if (expression.operator === "<<" && isOutputChain(expression.left)) {
+          for (const part of streamParts(expression, "<<")) {
+            const value = evaluate(part);
+            output.push(value === endLine ? "\n" : format(value));
+          }
+          return outputStream;
+        }
+        if (expression.operator === ">>" && isInputChain(expression.left)) {
+          for (const part of streamParts(expression, ">>")) {
+            const location = getLocation(part, expression.line);
+            const token = tokens[inputIndex++];
+            if (token === undefined) fault("cin ran out of input. Add the missing value to the input box.", expression.line);
+            writeLocation(location, convertInput(token, variableType(location)));
+          }
+          return inputStream;
+        }
+        const left = evaluate(expression.left);
+        if (expression.operator === "&&" && !truthy(left)) return false;
+        if (expression.operator === "||" && truthy(left)) return true;
+        const right = evaluate(expression.right);
+        return applyOperator(expression.operator, left, right, expression.line);
+      }
+      case "conditional":
+        return truthy(evaluate(expression.condition))
+          ? evaluate(expression.consequence)
+          : evaluate(expression.alternative);
+      case "call": {
+        const args = expression.args.map(evaluate);
+        const name = expression.callee;
+        const lastSeparator = name.lastIndexOf(".");
+        const method = lastSeparator >= 0 ? name.slice(lastSeparator + 1) : name;
+        const receiver = lastSeparator >= 0 ? args[0] : undefined;
+        const callArgs = lastSeparator >= 0 ? args.slice(1) : args;
+        if (lastSeparator >= 0) return callMethod(receiver, method, callArgs, expression.line);
+        switch (name) {
+          case "min": return Math.min(...callArgs.map(toNumber));
+          case "max": return Math.max(...callArgs.map(toNumber));
+          case "abs": return Math.abs(toNumber(callArgs[0]));
+          case "swap": {
+            if (expression.args.length !== 2) fault("swap expects two values.", expression.line);
+            const first = getLocation(expression.args[0]!, expression.line);
+            const second = getLocation(expression.args[1]!, expression.line);
+            const old = readLocation(first, expression.line);
+            writeLocation(first, readLocation(second, expression.line));
+            writeLocation(second, old);
+            return undefined;
+          }
+          default:
+            return callFunction(name, callArgs, expression.line);
+        }
+      }
+    }
+  };
+
+  const getLocation = (expression: Expr, line: number): Location => {
+    if (expression.kind === "identifier") {
+      const resolved = resolveVariable(expression.name);
+      if (!resolved) return fault(`“${expression.name}” is not defined.`, line);
+      return { kind: "variable", vars: resolved.vars, name: expression.name };
+    }
+    if (expression.kind === "index") {
+      const object = evaluate(expression.object);
+      if (!Array.isArray(object)) return fault("Only arrays and vectors can be assigned through an index.", line);
+      const index = toNumber(evaluate(expression.index));
+      if (!Number.isInteger(index) || index < 0 || index >= object.length) {
+        fault(`Index ${index} is out of bounds for length ${object.length}.`, line);
+      }
+      return { kind: "cell", array: object, index, name: `${expressionText(expression.object)}[${index}]` };
+    }
+    return fault("This value cannot be assigned to.", line);
+  };
+  const readLocation = (location: Location, line: number) => {
+    if (location.kind === "variable") {
+      const value = location.vars.get(location.name);
+      if (value === uninitialized) fault(`“${location.name}” is used before it is initialized.`, line);
+      return value;
+    }
+    reads.add(location.name);
+    return location.array[location.index];
+  };
+  const writeLocation = (location: Location, value: unknown) => {
+    if (location.kind === "variable") {
+      location.vars.set(location.name, value);
+      changes.add(location.name);
+    } else {
+      location.array[location.index] = value;
+      changes.add(location.name);
+    }
+  };
+  const variableType = (location: Location) =>
+    location.kind === "variable" ? typeOfVariable(location.name) ?? "auto" : "auto";
+
+  const callFunction = (name: string, args: unknown[], line: number): unknown => {
+    const fn = functions.get(name);
+    if (!fn) return fault(`Function “${name}” is not defined.`, line);
+    if (frames.length >= CALL_LIMIT) fault("Call stack exceeded 200 frames; recursion stopped.", line);
+    if (args.length !== fn.parameters.length) {
+      fault(`${name} expects ${fn.parameters.length} argument${fn.parameters.length === 1 ? "" : "s"}, but received ${args.length}.`, line);
+    }
+    const frame: Frame = { fn, vars: new Map(), types: new Map(), scopes: [] };
+    fn.parameters.forEach((parameter, index) => {
+      frame.vars.set(parameter.name, args[index]);
+      frame.types.set(parameter.name, parameter.type);
+    });
+    frames.push(frame);
+    record(fn.line);
+    let value: unknown;
+    try {
+      execute(fn.body);
+      value = undefined;
+    } catch (signal) {
+      if (signal instanceof FlowSignal && signal.type === "return") value = signal.value;
+      else throw signal;
+    } finally {
+      frames.pop();
+    }
+    returned = value;
+    return value;
+  };
+
+  const callMethod = (receiver: unknown, method: string, args: unknown[], line: number) => {
+    if (method === "size" || method === "length") {
+      if (Array.isArray(receiver) || typeof receiver === "string") return receiver.length;
+      fault(`${method}() requires a vector, array, or string.`, line);
+    }
+    if (method === "empty") {
+      if (Array.isArray(receiver) || typeof receiver === "string") return receiver.length === 0;
+      fault("empty() requires a vector, array, or string.", line);
+    }
+    if (method === "back") {
+      if (Array.isArray(receiver) && receiver.length > 0) return receiver.at(-1);
+      fault("back() cannot be used on an empty vector.", line);
+    }
+    if (method === "push_back") {
+      if (!Array.isArray(receiver)) return fault("push_back() requires a vector.", line);
+      receiver.push(args[0]);
+      changes.add(`${nameOfValue(receiver)}[${receiver.length - 1}]`);
+      return undefined;
+    }
+    if (method === "pop_back") {
+      if (!Array.isArray(receiver)) return fault("pop_back() requires a vector.", line);
+      if (!receiver.length) fault("pop_back() cannot be used on an empty vector.", line);
+      const index = receiver.length - 1;
+      receiver.pop();
+      changes.add(`${nameOfValue(receiver)}[${index}]`);
+      return undefined;
+    }
+    if (method === "swap") {
+      if (!Array.isArray(receiver) || !Array.isArray(args[0])) return fault("swap() requires two vectors.", line);
+      const copy = [...receiver];
+      receiver.splice(0, receiver.length, ...args[0]);
+      (args[0] as unknown[]).splice(0, (args[0] as unknown[]).length, ...copy);
+      changes.add(nameOfValue(receiver));
+      changes.add(nameOfValue(args[0]));
+      return undefined;
+    }
+    return fault(`Vector method “${method}” is not supported yet.`, line);
+  };
+
+  try {
+    if (parsed.errors.length) {
+      const first = parsed.errors[0]!;
+      throw new RuntimeFault(first.message, first.line);
+    }
+    if (!main) throw new RuntimeFault("No main() function was found.", 1);
+    callFunction("main", [], main.line);
+    if (returned !== undefined) {
+      // The return value is exposed in the final snapshot for inspection.
+      const final = snapshots.at(-1);
+      if (final) final.variables["$return"] = clone(returned);
+    }
+  } catch (caught) {
+    if (caught instanceof RuntimeFault) {
+      error = { line: caught.line, message: caught.message, nodeId: nodeForLine(caught.line) };
+      if (stepCount < STEP_LIMIT) {
+        try {
+          record(caught.line);
+        } catch {
+          // The cap was already reached; the last recorded snapshot remains useful.
+        }
+      }
+    } else if (caught instanceof FlowSignal) {
+      error = { line: main?.line ?? 1, message: `${caught.type} used outside a matching statement.` };
+    } else {
+      error = { line: main?.line ?? 1, message: caught instanceof Error ? caught.message : "The program stopped with an unknown error." };
+    }
+  }
+  return {
+    snapshots,
+    error,
+    output: output.join(""),
+    variables: snapshots.at(-1)?.variables ?? {},
+  };
+
+  function applyOperator(operator: string, left: unknown, right: unknown, line: number): unknown {
+    const a = left as number | string;
+    const b = right as number | string;
+    switch (operator) {
+      case "+": return typeof a === "string" || typeof b === "string" ? String(a) + String(b) : toNumber(a) + toNumber(b);
+      case "-": return toNumber(a) - toNumber(b);
+      case "*": return toNumber(a) * toNumber(b);
+      case "/":
+        if (toNumber(b) === 0) fault("Division by zero.", line);
+        return toNumber(a) / toNumber(b);
+      case "%":
+        if (toNumber(b) === 0) fault("Division by zero.", line);
+        return toNumber(a) % toNumber(b);
+      case "<": return (a as never) < (b as never);
+      case "<=": return (a as never) <= (b as never);
+      case ">": return (a as never) > (b as never);
+      case ">=": return (a as never) >= (b as never);
+      case "==": return a === b;
+      case "!=": return a !== b;
+      case "&&": return truthy(left) && truthy(right);
+      case "||": return truthy(left) || truthy(right);
+      case "&": return toNumber(a) & toNumber(b);
+      case "|": return toNumber(a) | toNumber(b);
+      case "^": return toNumber(a) ^ toNumber(b);
+      case "<<": return toNumber(a) << toNumber(b);
+      case ">>": return toNumber(a) >> toNumber(b);
+      default: return fault(`Operator “${operator}” is not supported yet.`, line);
+    }
+  }
+
+  function isOutputChain(expression: Expr): boolean {
+    return expression.kind === "identifier" && expression.name === "cout" ||
+      expression.kind === "binary" && expression.operator === "<<" && isOutputChain(expression.left);
+  }
+  function isInputChain(expression: Expr): boolean {
+    return expression.kind === "identifier" && expression.name === "cin" ||
+      expression.kind === "binary" && expression.operator === ">>" && isInputChain(expression.left);
+  }
+  function streamParts(expression: Expr, operator: "<<" | ">>"): Expr[] {
+    if (expression.kind === "binary" && expression.operator === operator) {
+      return [...streamParts(expression.left, operator), expression.right];
+    }
+    return [];
+  }
+}
+
+function defaultValue(type: string): unknown {
+  if (type.includes("vector")) return [];
+  if (type.includes("string")) return "";
+  if (type.includes("bool")) return false;
+  if (type.includes("char")) return "\0";
+  if (type.includes("int") || type.includes("double") || type.includes("float") || type.includes("long") || type.includes("short")) return 0;
+  return uninitialized;
+}
+
+function currentScope(frame: Frame) {
+  return frame.scopes.at(-1) ?? { vars: frame.vars, types: frame.types };
+}
+
+function visibleVariables(frame: Frame) {
+  const visible = new Map(frame.vars);
+  for (const scope of frame.scopes) {
+    for (const [name, value] of scope.vars) visible.set(name, value);
+  }
+  return visible;
+}
+
+function arrayElementType(type: string) {
+  return type.includes("vector") ? type.slice(type.indexOf("<") + 1, type.lastIndexOf(">")) : type;
+}
+
+function toNumber(value: unknown) {
+  if (typeof value === "boolean") return value ? 1 : 0;
+  const converted = Number(value);
+  if (!Number.isFinite(converted)) return 0;
+  return converted;
+}
+
+function truthy(value: unknown) {
+  if (Array.isArray(value)) return value.length > 0;
+  return Boolean(value);
+}
+
+function format(value: unknown) {
+  if (value === undefined) return "undefined";
+  if (value === null) return "nullptr";
+  if (typeof value === "boolean") return value ? "1" : "0";
+  return String(value);
+}
+
+function convertInput(token: string, type: string) {
+  if (type.includes("string")) return token;
+  if (type.includes("char")) return token[0] ?? "";
+  if (type.includes("bool")) return token === "true" || token === "1";
+  const number = Number(token);
+  if (Number.isNaN(number)) return token;
+  return number;
+}
+
+function clone<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(clone) as T;
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, clone(nested)])) as T;
+  }
+  return value;
+}
+
+function nameOfValue(value: unknown) {
+  return Array.isArray(value) ? "vector" : "array";
+}
+
+function expressionText(expression: Expr): string {
+  if (expression.kind === "identifier") return expression.name;
+  if (expression.kind === "literal") return String(expression.value);
+  if (expression.kind === "index") return `${expressionText(expression.object)}[${expressionText(expression.index)}]`;
+  return "value";
+}
