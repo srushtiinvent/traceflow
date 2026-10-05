@@ -18,7 +18,9 @@ type Frame = {
 
 type Location =
   | { kind: "variable"; vars: Map<string, unknown>; name: string }
+  | { kind: "property"; object: Record<string, unknown>; name: string }
   | { kind: "cell"; array: unknown[]; index: number; name: string };
+type RuntimeLambda = { __traceflowLambda: true; fn: FunctionAst };
 
 class RuntimeFault extends Error {
   constructor(message: string, readonly line: number) {
@@ -38,6 +40,7 @@ export function runProgram(source: string, stdin: string): RunResult {
   let error: RuntimeError | undefined;
   let stepCount = 0;
   const functions = new Map(parsed.functions.map((fn) => [fn.name, fn]));
+  const classes = new Map(parsed.classes.map((type) => [type.name, type]));
   const main = functions.get("main");
   const frames: Frame[] = [];
   const tokens = stdin.split(/\s+/).filter(Boolean);
@@ -130,7 +133,7 @@ export function runProgram(source: string, stdin: string): RunResult {
           if (!frame) return fault("Variable declaration is outside a function.", declaration.line);
           const scope = currentScope(frame);
           if (scope.vars.has(declaration.name)) return fault(`“${declaration.name}” is already declared in this scope.`, declaration.line);
-          let value: unknown = defaultValue(declaration.type);
+          let value: unknown = classes.has(declaration.type.replace(/\*+$/, "")) ? makeObject(declaration.type.replace(/\*+$/, "")) : defaultValue(declaration.type);
           if (declaration.arraySize) {
             const size = toNumber(evaluate(declaration.arraySize));
             if (!Number.isInteger(size) || size < 0 || size > 100_000) return fault("Array size must be a non-negative integer no greater than 100,000.", declaration.line);
@@ -138,7 +141,11 @@ export function runProgram(source: string, stdin: string): RunResult {
           }
           if (declaration.initializer) {
             const initial = evaluate(declaration.initializer);
-            value = Array.isArray(initial) ? clone(initial) : initial;
+            if (declaration.type.includes("vector") && declaration.initializer.kind === "list" && declaration.initializer.form === "arguments" && Array.isArray(initial) && typeof initial[0] === "number") {
+              const size = toNumber(initial[0]);
+              if (!Number.isInteger(size) || size < 0 || size > 100_000) return fault("Vector size must be a non-negative integer no greater than 100,000.", declaration.line);
+              value = Array.from({ length: size }, () => clone(initial.length > 1 ? initial[1] : defaultValue(arrayElementType(declaration.type))));
+            } else value = Array.isArray(initial) ? clone(initial) : initial;
           }
           scope.vars.set(declaration.name, value);
           scope.types.set(declaration.name, declaration.type);
@@ -185,21 +192,28 @@ export function runProgram(source: string, stdin: string): RunResult {
         return;
       }
       case "for": {
-        if (statement.initializer) execute(statement.initializer);
-        while (statement.condition ? truthy(evaluate(statement.condition)) : true) {
+        const frame = currentFrame();
+        if (!frame) return fault("For loop is outside a function.", statement.line);
+        frame.scopes.push({ vars: new Map(), types: new Map() });
+        try {
+          if (statement.initializer) execute(statement.initializer);
+          while (statement.condition ? truthy(evaluate(statement.condition)) : true) {
+            record(statement.line);
+            try {
+              execute(statement.body);
+            } catch (signal) {
+              if (signal instanceof FlowSignal && signal.type === "break") break;
+              if (!(signal instanceof FlowSignal && signal.type === "continue")) throw signal;
+            }
+            if (statement.update) {
+              evaluate(statement.update);
+              record(statement.update.line);
+            }
+          }
           record(statement.line);
-          try {
-            execute(statement.body);
-          } catch (signal) {
-            if (signal instanceof FlowSignal && signal.type === "break") break;
-            if (!(signal instanceof FlowSignal && signal.type === "continue")) throw signal;
-          }
-          if (statement.update) {
-            evaluate(statement.update);
-            record(statement.update.line);
-          }
+        } finally {
+          frame.scopes.pop();
         }
-        record(statement.line);
         return;
       }
       case "rangeFor": {
@@ -260,6 +274,8 @@ export function runProgram(source: string, stdin: string): RunResult {
       }
       case "list":
         return expression.values.map(evaluate);
+      case "lambda":
+        return { __traceflowLambda: true, fn: { name: expression.name ?? "<lambda>", returnType: "auto", parameters: expression.parameters, body: expression.body, line: expression.line } } satisfies RuntimeLambda;
       case "index": {
         const object = evaluate(expression.object);
         const index = evaluate(expression.index);
@@ -272,6 +288,7 @@ export function runProgram(source: string, stdin: string): RunResult {
       }
       case "member": {
         const object = evaluate(expression.object);
+        if (object === null || object === undefined) return fault("Cannot access a field through nullptr.", expression.line);
         if (expression.property === "size" && Array.isArray(object)) return object.length;
         if (expression.property === "length" && typeof object === "string") return object.length;
         return (object as Record<string, unknown> | null)?.[expression.property];
@@ -284,8 +301,9 @@ export function runProgram(source: string, stdin: string): RunResult {
           case "+": return toNumber(value);
           case "~": return ~toNumber(value);
           case "*":
-          case "&":
-            return fault("Pointer and reference operators are not supported yet.", expression.line);
+            if (value === null || value === undefined) return fault("Cannot dereference nullptr.", expression.line);
+            return value;
+          case "&": return value;
           default:
             return fault(`Unary operator “${expression.operator}” is not supported yet.`, expression.line);
         }
@@ -337,6 +355,19 @@ export function runProgram(source: string, stdin: string): RunResult {
       case "call": {
         const args = expression.args.map(evaluate);
         const name = expression.callee;
+        if (name.startsWith("new:")) {
+          const typeName = name.slice(4);
+          if (!classes.has(typeName)) return fault(`Cannot allocate unknown type “${typeName}”.`, expression.line);
+          const object = makeObject(typeName);
+          construct(object, typeName, args, expression.line);
+          return object;
+        }
+        if (name === "delete") return undefined;
+        if (classes.has(name)) {
+          const object = makeObject(name);
+          construct(object, name, args, expression.line);
+          return object;
+        }
         const lastSeparator = name.lastIndexOf(".");
         const method = lastSeparator >= 0 ? name.slice(lastSeparator + 1) : name;
         const receiver = lastSeparator >= 0 ? args[0] : undefined;
@@ -346,6 +377,11 @@ export function runProgram(source: string, stdin: string): RunResult {
           case "min": return Math.min(...callArgs.map(toNumber));
           case "max": return Math.max(...callArgs.map(toNumber));
           case "abs": return Math.abs(toNumber(callArgs[0]));
+          case "vector": {
+            const size = toNumber(callArgs[0]);
+            if (!Number.isInteger(size) || size < 0 || size > 100_000) return fault("Vector size must be a non-negative integer no greater than 100,000.", expression.line);
+            return Array.from({ length: size }, () => clone(callArgs.length > 1 ? callArgs[1] : 0));
+          }
           case "swap": {
             if (expression.args.length !== 2) fault("swap expects two values.", expression.line);
             const first = getLocation(expression.args[0]!, expression.line);
@@ -355,8 +391,18 @@ export function runProgram(source: string, stdin: string): RunResult {
             writeLocation(second, old);
             return undefined;
           }
-          default:
+          default: {
+            const callable = resolveVariable(name)?.vars.get(name) as RuntimeLambda | undefined;
+            if (callable?.__traceflowLambda) return executeLambda(callable, callArgs, expression.line);
+            const self = currentFrame()?.vars.get("this");
+            if (self && typeof self === "object") {
+              const owner = classes.get(String((self as Record<string, unknown>).__type ?? ""));
+              if (owner?.methods.some((candidate) => candidate.name === name)) {
+                return callMethod(self, name, callArgs, expression.line);
+              }
+            }
             return callFunction(name, callArgs, expression.line);
+          }
         }
       }
     }
@@ -367,6 +413,16 @@ export function runProgram(source: string, stdin: string): RunResult {
       const resolved = resolveVariable(expression.name);
       if (!resolved) return fault(`“${expression.name}” is not defined.`, line);
       return { kind: "variable", vars: resolved.vars, name: expression.name };
+    }
+    if (expression.kind === "member") {
+      const object = evaluate(expression.object);
+      if (!object || typeof object !== "object") return fault("Member access requires an object.", line);
+      return { kind: "property", object: object as Record<string, unknown>, name: expression.property };
+    }
+    if (expression.kind === "unary" && expression.operator === "*") {
+      const object = evaluate(expression.argument);
+      if (!object || typeof object !== "object") return fault("Cannot dereference nullptr.", line);
+      return { kind: "property", object: object as Record<string, unknown>, name: "value" };
     }
     if (expression.kind === "index") {
       const object = evaluate(expression.object);
@@ -385,12 +441,16 @@ export function runProgram(source: string, stdin: string): RunResult {
       if (value === uninitialized) fault(`“${location.name}” is used before it is initialized.`, line);
       return value;
     }
+    if (location.kind === "property") { reads.add(location.name); return location.object[location.name]; }
     reads.add(location.name);
     return location.array[location.index];
   };
   const writeLocation = (location: Location, value: unknown) => {
     if (location.kind === "variable") {
       location.vars.set(location.name, value);
+      changes.add(location.name);
+    } else if (location.kind === "property") {
+      location.object[location.name] = value;
       changes.add(location.name);
     } else {
       location.array[location.index] = value;
@@ -428,7 +488,24 @@ export function runProgram(source: string, stdin: string): RunResult {
     return value;
   };
 
+  const executeLambda = (lambda: RuntimeLambda, args: unknown[], line: number) => {
+    const fn = lambda.fn;
+    if (args.length !== fn.parameters.length) return fault(`Lambda expects ${fn.parameters.length} arguments, but received ${args.length}.`, line);
+    const frame: Frame = { fn, vars: new Map(), types: new Map(), scopes: [] };
+    fn.parameters.forEach((parameter, index) => { frame.vars.set(parameter.name, args[index]); frame.types.set(parameter.name, parameter.type); });
+    frames.push(frame); record(fn.line);
+    try { execute(fn.body); return undefined; }
+    catch (signal) { if (signal instanceof FlowSignal && signal.type === "return") return signal.value; throw signal; }
+    finally { frames.pop(); }
+  };
+
   const callMethod = (receiver: unknown, method: string, args: unknown[], line: number) => {
+    if (receiver && typeof receiver === "object") {
+      const typeName = String((receiver as Record<string, unknown>).__type ?? "");
+      const type = classes.get(typeName);
+      const fn = type?.methods.find((candidate) => candidate.name === method);
+      if (fn) return executeMethod(fn, receiver, args, line);
+    }
     if (method === "size" || method === "length") {
       if (Array.isArray(receiver) || typeof receiver === "string") return receiver.length;
       fault(`${method}() requires a vector, array, or string.`, line);
@@ -467,6 +544,39 @@ export function runProgram(source: string, stdin: string): RunResult {
     return fault(`Vector method “${method}” is not supported yet.`, line);
   };
 
+  const makeObject = (name: string): Record<string, unknown> => {
+    const type = classes.get(name)!;
+    const object: Record<string, unknown> = {};
+    Object.defineProperty(object, "__type", { value: name, enumerable: false });
+    for (const field of type.fields) object[field.name] = defaultValue(field.type);
+    return object;
+  };
+  const executeMethod = (fn: FunctionAst, self: unknown, args: unknown[], line: number) => {
+    if (args.length !== fn.parameters.length) return fault(`${fn.name} expects ${fn.parameters.length} argument(s), but received ${args.length}.`, line);
+    const frame: Frame = { fn, vars: new Map([["this", self]]), types: new Map([["this", "object"]]), scopes: [] };
+    fn.parameters.forEach((parameter, index) => { frame.vars.set(parameter.name, args[index]); frame.types.set(parameter.name, parameter.type); });
+    frames.push(frame); record(fn.line);
+    try {
+      if (self && typeof self === "object") {
+        const classType = classes.get(String((self as Record<string, unknown>).__type ?? ""));
+        if (classType?.name === fn.name) {
+          for (const [field, initializers] of Object.entries(classType.constructorInitializers)) {
+            (self as Record<string, unknown>)[field] = initializers.length ? evaluate(initializers[0]!) : undefined;
+          }
+        }
+      }
+      execute(fn.body); return undefined;
+    }
+    catch (signal) { if (signal instanceof FlowSignal && signal.type === "return") return signal.value; throw signal; }
+    finally { frames.pop(); }
+  };
+  const construct = (object: unknown, name: string, args: unknown[], line: number) => {
+    const type = classes.get(name)!;
+    const constructor = type.methods.find((fn) => fn.name === name);
+    if (constructor) executeMethod(constructor, object, args, line);
+    else if (args.length) fault(`${name} has no matching constructor.`, line);
+  };
+
   try {
     if (parsed.errors.length) {
       const first = parsed.errors[0]!;
@@ -500,6 +610,7 @@ export function runProgram(source: string, stdin: string): RunResult {
     error,
     output: output.join(""),
     variables: snapshots.at(-1)?.variables ?? {},
+    unusedInput: tokens.slice(inputIndex),
   };
 
   function applyOperator(operator: string, left: unknown, right: unknown, line: number): unknown {
@@ -549,6 +660,7 @@ export function runProgram(source: string, stdin: string): RunResult {
 }
 
 function defaultValue(type: string): unknown {
+  if (type.trimEnd().endsWith("*")) return null;
   if (type.includes("vector")) return [];
   if (type.includes("string")) return "";
   if (type.includes("bool")) return false;
@@ -604,6 +716,10 @@ function convertInput(token: string, type: string) {
 function clone<T>(value: T): T {
   if (Array.isArray(value)) return value.map(clone) as T;
   if (value && typeof value === "object") {
+    if ((value as { __traceflowLambda?: boolean }).__traceflowLambda) {
+      const label = `[Function: ${(value as unknown as RuntimeLambda).fn.name}]`;
+      return label as T;
+    }
     return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, clone(nested)])) as T;
   }
   return value;

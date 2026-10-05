@@ -54,7 +54,7 @@ async function decodeSharedState(encoded: string) {
   return state;
 }
 function formatValue(value: unknown) {
-  if (typeof value === 'string') return `"${value}"`;
+  if (typeof value === 'string') return value.startsWith('[Function: ') ? value : `"${value}"`;
   if (Array.isArray(value)) return `[${value.map((item) => String(item)).join(', ')}]`;
   if (value && typeof value === 'object') return JSON.stringify(value);
   return String(value);
@@ -67,10 +67,14 @@ function snapshotValues(snapshot?: TraceSnapshot): Record<string, unknown> {
 function nodeKind(node: FlowItem) {
   return String(node.kind ?? 'statement').replace(/[_-]/g, ' ');
 }
+function readDraft(key: string, fallback: string) {
+  try { return localStorage.getItem(key) ?? fallback; }
+  catch { return fallback; }
+}
 
 function App() {
-  const [source, setSource] = useState(INITIAL_CODE);
-  const [stdin, setStdin] = useState('');
+  const [source, setSource] = useState(() => readDraft('traceflow-draft-source', INITIAL_CODE));
+  const [stdin, setStdin] = useState(() => readDraft('traceflow-draft-stdin', ''));
   const [graph, setGraph] = useState<ProgramGraph | null>(null);
   const [run, setRun] = useState<RunResult | null>(null);
   const [parserReady, setParserReady] = useState(false);
@@ -81,6 +85,7 @@ function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [speed, setSpeed] = useState('1×');
   const [functionName, setFunctionName] = useState('');
+  const [followTraceFunction, setFollowTraceFunction] = useState(true);
   const [cursorLine, setCursorLine] = useState(0);
   const [selectedNodeId, setSelectedNodeId] = useState('');
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
@@ -113,6 +118,14 @@ function App() {
     document.documentElement.classList.toggle('dark', theme === 'dark');
     localStorage.setItem('traceflow-theme', theme);
   }, [theme]);
+
+  useEffect(() => {
+    try { localStorage.setItem('traceflow-draft-source', source); } catch { /* Storage may be unavailable or full. */ }
+  }, [source]);
+
+  useEffect(() => {
+    try { localStorage.setItem('traceflow-draft-stdin', stdin); } catch { /* Storage may be unavailable or full. */ }
+  }, [stdin]);
 
   useEffect(() => {
     let active = true;
@@ -167,15 +180,16 @@ function App() {
     return () => window.clearTimeout(timeout);
   }, [source, parserReady]);
 
+  const snapshots = run?.snapshots ?? [];
+  const activeSnapshot = snapshots[Math.min(activeIndex, Math.max(0, snapshots.length - 1))];
+  const traceFunctionName = activeSnapshot?.nodeId.split(':')[0];
   const activeFunction: FunctionGraph | undefined = useMemo(
-    () => graph?.functions.find((fn) => fn.name === functionName) ?? graph?.functions[0],
-    [graph, functionName],
+    () => (followTraceFunction ? graph?.functions.find((fn) => fn.name === traceFunctionName) : undefined) ?? graph?.functions.find((fn) => fn.name === functionName) ?? graph?.functions[0],
+    [followTraceFunction, graph, functionName, traceFunctionName],
   );
   activeFunctionRef.current = activeFunction;
   const nodes = activeFunction?.nodes ?? [];
   const edges = activeFunction?.edges ?? [];
-  const snapshots = run?.snapshots ?? [];
-  const activeSnapshot = snapshots[Math.min(activeIndex, Math.max(0, snapshots.length - 1))];
   const values = snapshotValues(activeSnapshot);
   const prevValues = activeIndex > 0 ? snapshotValues(snapshots[Math.min(activeIndex, snapshots.length - 1) - 1]) : {};
   const errors = syntaxIssues;
@@ -219,12 +233,20 @@ function App() {
   const runCurrent = useCallback(() => {
     const result = execute(sourceRef.current, stdin);
     if (!result) return;
+    const firstAlgorithmStep = result.snapshots.findIndex((snapshot) => {
+      const name = snapshot.nodeId.split(':')[0];
+      return name !== 'main' && graph?.functions.some((fn) => fn.name === name);
+    });
+    const initialNodeId = result.snapshots[firstAlgorithmStep >= 0 ? firstAlgorithmStep : 0]?.nodeId;
+    const initialFunction = initialNodeId?.split(':')[0] ?? 'main';
     setRun(result);
-    setActiveIndex(0);
+    setFunctionName(initialFunction);
+    setFollowTraceFunction(false);
+    setActiveIndex(firstAlgorithmStep >= 0 ? firstAlgorithmStep : 0);
     setIsPlaying(false);
     setMobileView('visualise');
     notify(`${result.snapshots.length} steps ready`);
-  }, [execute, notify, stdin]);
+  }, [execute, graph, notify, stdin]);
 
   const step = (direction: number) => {
     setIsPlaying(false);
@@ -378,7 +400,7 @@ function App() {
             <div className="pane-head">
               <div className="pane-label"><GitBranch size={15} /> Flowchart <span className="pane-meta">{nodes.length ? `${nodes.length} nodes` : ''}</span></div>
               <div className="flow-head-right">
-                {graph?.functions?.length ? <select aria-label="Select function" value={activeFunction?.name ?? ''} onChange={(event) => { setFunctionName(event.target.value); setActiveIndex(0); }} className="function-select" data-testid="select-function">{graph.functions.map((fn) => <option key={fn.name} value={fn.name}>{fn.name}()</option>)}</select> : null}
+                {graph?.functions?.length ? <select aria-label="Select function" value={activeFunction?.name ?? ''} onChange={(event) => { setFunctionName(event.target.value); setFollowTraceFunction(false); }} className="function-select" data-testid="select-function">{graph.functions.map((fn) => <option key={fn.name} value={fn.name}>{fn.name}()</option>)}</select> : null}
                 <button className="icon-button" title="Reset" aria-label="Reset" onClick={() => { setRun(null); setActiveIndex(0); setIsPlaying(false); }} data-testid="button-reset"><RotateCcw size={14} /></button>
               </div>
             </div>
@@ -396,7 +418,7 @@ function App() {
           {compareOpen ? <div className="surface compare-panel"><div className="compare-head"><h3>Compare traces</h3><div><button className="primary-button" onClick={compare} data-testid="button-run-compare"><Play size={12} /> Run comparison</button><button className="icon-button" onClick={() => setCompareOpen(false)} aria-label="Close comparison" data-testid="button-close-compare"><X size={14} /></button></div></div><textarea aria-label="Comparison source code" value={compareSource} onChange={(event) => setCompareSource(event.target.value)} data-testid="input-compare-code" /><div className="compare-diff">{compareRun ? `Output ${compareRun.output === (run?.output ?? '') ? 'matches' : 'differs'} · ${snapshots.length} vs ${compareRun.snapshots.length} snapshots\n\nOriginal output:\n${run?.output || '(empty)'}\n\nComparison output:\n${compareRun.output || '(empty)'}` : 'Edit a second version of the program, then run both traces to compare their output and step counts.'}</div></div> :
             <div className="surface compare-panel">
               <div className="pane-head"><div className="pane-label"><Activity size={15} /> Execution</div><span className="pane-meta">{run ? `${snapshots.length} captured steps` : 'Waiting for run'}</span></div>
-              <div className="inspector-body">{run ? <><div className="state-grid"><div className="state-card"><span className="state-name">TRACE STATUS</span><span className="state-value">{run.error ? 'Runtime error' : 'Completed'}</span></div><div className="state-card"><span className="state-name">CURRENT STEP</span><span className="state-value">{snapshots.length ? `${activeIndex + 1} / ${snapshots.length}` : '—'}</span></div><div className="state-card"><span className="state-name">SOURCE LINE</span><span className="state-value">{activeLine || '—'}</span></div></div><div className="inspector-empty" style={{ minHeight: 46, alignItems: 'flex-start' }}>{run.error ? run.error.message : 'Scrub the timeline to inspect every captured state.'}</div></> : <div className="inspector-empty"><Activity size={18} /><span>Execution state will appear here when you run the program.</span></div>}</div>
+              <div className="inspector-body">{run ? <><div className="state-grid"><div className="state-card"><span className="state-name">TRACE STATUS</span><span className="state-value">{run.error ? 'Runtime error' : 'Completed'}</span></div><div className="state-card"><span className="state-name">CURRENT STEP</span><span className="state-value">{snapshots.length ? `${activeIndex + 1} / ${snapshots.length}` : '—'}</span></div><div className="state-card"><span className="state-name">SOURCE LINE</span><span className="state-value">{activeLine || '—'}</span></div></div><div className="pane-meta" style={{ marginTop: 10 }}>INPUT USED · {stdin.trim() || '(empty)'}</div>{run.unusedInput?.length ? <div className="pane-meta" style={{ marginTop: 6 }}>UNUSED INPUT · {run.unusedInput.join(' ')}</div> : null}<div className="pane-meta" style={{ marginTop: 12, marginBottom: 6 }}>PROGRAM OUTPUT</div><pre className="output-text" data-testid="text-program-output">{run.output || '(no output)'}</pre>{run.error ? <div className="inspector-empty" style={{ minHeight: 32, alignItems: 'flex-start' }}>{run.error.message}</div> : null}</> : <div className="inspector-empty"><Activity size={18} /><span>Execution state will appear here when you run the program.</span></div>}</div>
             </div>}
         </section>
       </main>
@@ -422,13 +444,13 @@ function App() {
   );
 }
 
-type NodeData = { label: string; kind: string; shape: string; line: number; active: boolean; done: boolean; error: boolean; w: number; h: number };
+type NodeData = { label: string; runtime?: string; kind: string; shape: string; line: number; active: boolean; done: boolean; error: boolean; w: number; h: number };
 type EdgeData = { points: Array<{ x: number; y: number }>; label?: string; lx: number; ly: number; active: boolean; taken: boolean };
 
 function nodeSize(node: FlowItem) {
-  if (node.kind === 'decision') return { w: 240, h: 92 };
-  if (node.kind === 'start' || node.kind === 'end') return { w: 130, h: 40 };
-  return { w: 220, h: 56 };
+  if (node.kind === 'decision') return { w: 240, h: 108 };
+  if (node.kind === 'start' || node.kind === 'end') return { w: 150, h: 66 };
+  return { w: 220, h: 72 };
 }
 type Layout = {
   nodes: Map<string, { x: number; y: number; w: number; h: number }>;
@@ -488,6 +510,7 @@ function TraceFlowNode({ data, selected }: NodeProps<RFNode<NodeData>>) {
     <span className="node-body">
       <span className="node-kicker">{data.kind}{data.line ? ` · L${data.line}` : ''}</span>
       <span className="node-code">{shortLabel(data.label, shape === 'decision' ? 22 : 28)}</span>
+      {data.runtime ? <span className="node-runtime">{data.runtime}</span> : null}
     </span>
     <Handle type="source" position={Position.Bottom} />
   </div>;
@@ -513,18 +536,32 @@ function FlowInner({ nodes, edges, snapshots, activeSnapshot, errorNodeId, onSel
   const activeNodeId = activeSnapshot?.nodeId;
   const activeIndex = activeSnapshot ? snapshots.indexOf(activeSnapshot) : -1;
   const nextId = activeIndex >= 0 ? snapshots[activeIndex + 1]?.nodeId : undefined;
-  const visited = useMemo(() => new Set(activeIndex >= 0 ? snapshots.slice(0, activeIndex + 1).map((s) => s.nodeId) : []), [snapshots, activeIndex]);
+  const visited = useMemo(() => new Set(snapshots.map((snapshot) => snapshot.nodeId)), [snapshots]);
   const takenEdges = useMemo(() => {
     const set = new Set<string>();
-    for (let i = 0; i < activeIndex; i++) set.add(`${snapshots[i].nodeId}>${snapshots[i + 1].nodeId}`);
+    for (let i = 0; i < snapshots.length - 1; i++) set.add(`${snapshots[i].nodeId}>${snapshots[i + 1].nodeId}`);
     return set;
   }, [snapshots, activeIndex]);
+  const runtimeByNode = useMemo(() => {
+    const latest = new Map<string, { snapshot: TraceSnapshot; nextId?: string }>();
+    snapshots.forEach((snapshot, index) => latest.set(snapshot.nodeId, { snapshot, nextId: snapshots[index + 1]?.nodeId }));
+    return latest;
+  }, [snapshots]);
 
   const rfNodes: RFNode<NodeData>[] = nodes.map((node) => {
     const p = layout.nodes.get(node.id) ?? { x: 0, y: 0, w: 220, h: 56 };
+    const execution = runtimeByNode.get(node.id);
+    const runtimeNames = [...new Set([...(execution?.snapshot.reads ?? []), ...(execution?.snapshot.changes ?? [])])];
+    const runtimeValues = runtimeNames.flatMap((name) => {
+      const entry = Object.entries(execution?.snapshot.variables ?? {}).find(([key]) => key === name || key.endsWith(`.${name}`));
+      if (!entry || typeof entry[1] === 'object' && entry[1] !== null) return [];
+      return [`${name}=${String(entry[1])}`];
+    });
+    const branch = execution?.nextId ? edges.find((edge) => edge.source === node.id && edge.target === execution.nextId)?.label : undefined;
+    const runtime = [...runtimeValues.slice(0, 3), branch].filter(Boolean).join(' · ');
     return {
       id: node.id, type: 'traceNode', position: { x: p.x - p.w / 2, y: p.y - p.h / 2 }, width: p.w, height: p.h,
-      data: { label: node.label || node.code || `Line ${node.line}`, kind: nodeKind(node), shape: node.kind, line: node.line, active: node.id === activeNodeId, done: visited.has(node.id), error: node.id === errorNodeId, w: p.w, h: p.h },
+      data: { label: node.label || node.code || `Line ${node.line}`, runtime: runtime || undefined, kind: nodeKind(node), shape: node.kind, line: node.line, active: node.id === activeNodeId, done: visited.has(node.id), error: node.id === errorNodeId, w: p.w, h: p.h },
     };
   });
   const rfEdges: RFEdge<EdgeData>[] = edges.filter((e) => layout.edges.has(e.id)).map((edge) => {

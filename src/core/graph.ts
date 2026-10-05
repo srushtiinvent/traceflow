@@ -11,11 +11,44 @@ import type {
 
 export function buildProgramGraph(source: string): ProgramGraph {
   const parsed = parseProgram(source);
-  const functions = parsed.functions.map((fn) => buildFunctionGraph(fn, source));
+  const astFunctions = [
+    ...parsed.functions,
+    ...parsed.classes.flatMap((type) => type.methods),
+  ];
+  const lambdaFunctions = astFunctions.flatMap((fn) => collectLambdas(fn.body));
+  const functions = [...astFunctions, ...lambdaFunctions].map((fn) => buildFunctionGraph(fn, source));
   if (functions.length === 0 && parsed.errors.length === 0) {
     parsed.errors.push({ line: 1, message: "No function definition found. Add a main() function to run this program." });
   }
   return { functions, errors: parsed.errors };
+}
+
+function collectLambdas(root: Stmt): FunctionAst[] {
+  const found: FunctionAst[] = [];
+  const visitExpression = (expression: Expr) => {
+    if (expression.kind === "lambda") {
+      found.push({ name: expression.name ?? `lambda_${expression.line}`, returnType: "auto", parameters: expression.parameters, body: expression.body, line: expression.line });
+      visitStatement(expression.body);
+    } else if (expression.kind === "call") expression.args.forEach(visitExpression);
+    else if (expression.kind === "list") expression.values.forEach(visitExpression);
+    else if (expression.kind === "binary" || expression.kind === "assignment") { visitExpression(expression.left); visitExpression(expression.right); }
+    else if (expression.kind === "conditional") { visitExpression(expression.condition); visitExpression(expression.consequence); visitExpression(expression.alternative); }
+    else if (expression.kind === "unary" || expression.kind === "update") visitExpression(expression.argument);
+    else if (expression.kind === "index") { visitExpression(expression.object); visitExpression(expression.index); }
+    else if (expression.kind === "member") visitExpression(expression.object);
+  };
+  const visitStatement = (statement: Stmt): void => {
+    if (statement.kind === "block") statement.body.forEach(visitStatement);
+    else if (statement.kind === "declaration") statement.declarations.forEach((declaration) => declaration.initializer && visitExpression(declaration.initializer));
+    else if (statement.kind === "expression") visitExpression(statement.expression);
+    else if (statement.kind === "if") { visitExpression(statement.condition); visitStatement(statement.consequence); if (statement.alternative) visitStatement(statement.alternative); }
+    else if (statement.kind === "while" || statement.kind === "do") { visitExpression(statement.condition); visitStatement(statement.body); }
+    else if (statement.kind === "for") { if (statement.initializer) visitStatement(statement.initializer); if (statement.condition) visitExpression(statement.condition); if (statement.update) visitExpression(statement.update); visitStatement(statement.body); }
+    else if (statement.kind === "rangeFor") { visitExpression(statement.iterable); visitStatement(statement.body); }
+    else if (statement.kind === "return" && statement.value) visitExpression(statement.value);
+  };
+  visitStatement(root);
+  return found;
 }
 
 function buildFunctionGraph(fn: FunctionAst, source: string): FunctionGraph {
@@ -186,6 +219,7 @@ export function expressionText(expression: Expr): string {
     case "index": return `${expressionText(expression.object)}[${expressionText(expression.index)}]`;
     case "member": return `${expressionText(expression.object)}.${expression.property}`;
     case "list": return `{${expression.values.map(expressionText).join(", ")}}`;
+    case "lambda": return "lambda";
     case "unsupported": return `unsupported ${expression.label}`;
   }
 }

@@ -46,6 +46,7 @@ export type RunResult = {
   error?: RuntimeError;
   output: string;
   variables: Record<string, unknown>;
+  unusedInput?: string[];
 };
 
 export type Expr =
@@ -57,7 +58,8 @@ export type Expr =
   | { kind: "call"; callee: string; args: Expr[]; line: number }
   | { kind: "index"; object: Expr; index: Expr; line: number }
   | { kind: "member"; object: Expr; property: string; line: number }
-  | { kind: "list"; values: Expr[]; line: number }
+  | { kind: "list"; values: Expr[]; form?: "braces" | "arguments"; line: number }
+  | { kind: "lambda"; name?: string; parameters: Parameter[]; body: Stmt; line: number }
   | { kind: "unsupported"; label: string; line: number };
 
 export type VariableDecl = {
@@ -90,7 +92,8 @@ export type FunctionAst = {
   body: Stmt;
   line: number;
 };
-export type CppProgram = { functions: FunctionAst[]; errors: SyntaxIssue[] };
+export type ClassAst = { name: string; fields: VariableDecl[]; methods: FunctionAst[]; constructorInitializers: Record<string, Expr[]>; line: number };
+export type CppProgram = { functions: FunctionAst[]; classes: ClassAst[]; errors: SyntaxIssue[] };
 
 export type TraceVariable = {
   name: string;

@@ -1,6 +1,7 @@
 import Parser from "web-tree-sitter";
 import type {
   CppProgram,
+  ClassAst,
   Expr,
   FunctionAst,
   Parameter,
@@ -41,11 +42,13 @@ export function parseProgram(source: string): CppProgram {
   try {
     const errors = collectSyntaxIssues(tree.rootNode);
     const functions: FunctionAst[] = [];
+    const classes: ClassAst[] = [];
     const root = tree.rootNode;
     for (const child of root.namedChildren) {
       if (child.type === "function_definition") functions.push(parseFunction(child));
       else if (child.type === "class_specifier" || child.type === "struct_specifier") {
-        errors.push({ line: lineOf(child), message: "Classes and structs are not supported yet." });
+        const name = field(child, "name")?.text ?? child.namedChildren.find((part) => part.type === "type_identifier")?.text;
+        if (name) classes.push(parseClass(child, name));
       } else if (child.type === "template_declaration") {
         errors.push({ line: lineOf(child), message: "Function and class templates are not supported yet." });
       } else if (
@@ -56,10 +59,50 @@ export function parseProgram(source: string): CppProgram {
         errors.push({ line: lineOf(child), message: "Global variables are not supported yet; declare values inside main()." });
       }
     }
-    return { functions, errors: dedupeIssues(errors) };
+    return { functions, classes, errors: dedupeIssues(errors) };
   } finally {
     tree.delete();
   }
+}
+
+function parseClass(node: Node, name: string): ClassAst {
+  const fields: VariableDecl[] = [];
+  const methods: FunctionAst[] = [];
+  const constructorInitializers: Record<string, Expr[]> = {};
+  const body = field(node, "body") ?? node.namedChildren.find((part) => part.type === "field_declaration_list");
+  for (const member of body?.namedChildren ?? []) {
+    if (member.type === "field_declaration") {
+      const type = field(member, "type")?.text ?? "auto";
+      for (const part of member.namedChildren.filter((child) => ["field_declarator", "identifier", "init_declarator", "pointer_declarator"].includes(child.type))) {
+        const decl = part.type === "field_declarator" ? part.namedChildren[0] ?? part : part;
+        const variable = parseVariableDecl(decl, type);
+        if (firstOfType(decl, "pointer_declarator")) variable.type = `${type}*`;
+        fields.push(variable);
+      }
+    } else if (member.type === "function_definition" || member.type === "declaration") {
+      if (member.type === "function_definition") {
+        const method = parseFunction(member);
+        methods.push(method);
+        if (method.name === name) {
+          const initList = member.namedChildren.find((part) => part.type === "field_initializer_list");
+          for (const init of initList?.namedChildren ?? []) {
+            const fieldName = field(init, "field")?.text ?? init.namedChildren[0]?.text;
+            const args = field(init, "arguments")?.namedChildren ?? [];
+            if (fieldName) constructorInitializers[fieldName] = args.map(parseExpression);
+          }
+        }
+      }
+      else {
+        const declarator = member.namedChildren.find((part) => part.type === "function_declarator");
+        if (declarator) {
+          const fake = member;
+          const methodName = findDeclaredName(field(declarator, "declarator") ?? declarator);
+          methods.push({ name: methodName, returnType: field(member, "type")?.text ?? "void", parameters: field(declarator, "parameters")?.namedChildren.filter((part) => part.type === "parameter_declaration").map(parseParameter) ?? [], body: { kind: "empty", line: lineOf(member) }, line: lineOf(fake) });
+        }
+      }
+    }
+  }
+  return { name, fields, methods, constructorInitializers, line: lineOf(node) };
 }
 
 function parseFunction(node: Node): FunctionAst {
@@ -198,12 +241,16 @@ function parseDeclaration(node: Node): Stmt {
     part.type === "reference_declarator",
   );
   const declarations = declarators.map((part) => parseVariableDecl(part, type));
+  for (const declaration of declarations) {
+    if (declaration.initializer?.kind === "lambda") declaration.initializer.name = declaration.name;
+  }
   if (containsUnsupportedType(typeNode, type)) {
     return { kind: "unsupported", label: unsupportedTypeName(typeNode, type), line };
   }
-  if (declarations.some((decl) => decl.name === "<pointer>")) {
-    return { kind: "unsupported", label: "pointers and references", line };
-  }
+  declarations.forEach((decl, index) => {
+    const source = declarators[index];
+    if (source?.type === "pointer_declarator" || source?.type === "reference_declarator" || firstOfType(source, "pointer_declarator")) decl.type = `${type}*`;
+  });
   return { kind: "declaration", declarations, line };
 }
 
@@ -280,7 +327,10 @@ function parseExpression(node: Node): Expr {
     }
     case "unary_expression":
     case "pointer_expression": {
-      if (node.type === "pointer_expression") return { kind: "unsupported", label: "pointer expressions", line };
+      if (node.type === "pointer_expression") {
+        const argument = field(node, "argument") ?? node.namedChildren[0];
+        return argument ? { kind: "unary", operator: field(node, "operator")?.text ?? node.text[0] ?? "*", argument: parseExpression(argument), line } : { kind: "unsupported", label: "pointer expression", line };
+      }
       const argument = field(node, "argument") ?? node.namedChildren[0];
       if (!argument) return { kind: "unsupported", label: "unary expression", line };
       return { kind: "unary", operator: field(node, "operator")?.text ?? "", argument: parseExpression(argument), line };
@@ -304,6 +354,16 @@ function parseExpression(node: Node): Expr {
       }
       return { kind: "call", callee: expressionName(parseExpression(fn)), args, line };
     }
+    case "lambda_expression": {
+      const declarator = node.namedChildren.find((child) => child.type === "abstract_function_declarator" || child.type === "function_declarator");
+      const parameters = declarator?.namedChildren.find((child) => child.type === "parameter_list")?.namedChildren
+        .filter((child) => child.type === "parameter_declaration")
+        .map(parseParameter) ?? [];
+      const body = node.namedChildren.find((child) => child.type === "compound_statement");
+      return { kind: "lambda", parameters, body: body ? parseStatement(body) : { kind: "empty", line }, line };
+    }
+    case "template_function":
+      return { kind: "identifier", name: node.namedChildren[0]?.text ?? node.text.split("<")[0] ?? "", line };
     case "subscript_expression": {
       const object = field(node, "argument");
       const index = field(node, "indices")?.namedChildren[0];
@@ -319,20 +379,24 @@ function parseExpression(node: Node): Expr {
         : { kind: "unsupported", label: "member access", line };
     }
     case "initializer_list":
-    case "argument_list":
     case "initializer_list_expression":
-      return { kind: "list", values: node.namedChildren.map(parseExpression), line };
+      return { kind: "list", values: node.namedChildren.map(parseExpression), form: "braces", line };
+    case "argument_list":
+      return { kind: "list", values: node.namedChildren.map(parseExpression), form: "arguments", line };
     case "cast_expression":
     case "type_cast_expression":
       return node.namedChildren.length > 1
         ? parseExpression(node.namedChildren.at(-1)!)
         : { kind: "unsupported", label: "type casts", line };
-    case "lambda_expression":
-      return { kind: "unsupported", label: "lambda expressions", line };
-    case "new_expression":
-      return { kind: "unsupported", label: "dynamic allocation", line };
-    case "delete_expression":
-      return { kind: "unsupported", label: "delete expressions", line };
+    case "new_expression": {
+      const type = field(node, "type")?.text ?? node.namedChildren.find((part) => part.type === "type_identifier")?.text ?? "";
+      const args = node.namedChildren.find((part) => part.type === "arguments")?.namedChildren.map(parseExpression) ?? [];
+      return { kind: "call", callee: `new:${type}`, args, line };
+    }
+    case "delete_expression": {
+      const argument = node.namedChildren[0];
+      return argument ? { kind: "call", callee: "delete", args: [parseExpression(argument)], line } : { kind: "literal", value: undefined, line };
+    }
     default:
       if (!node.namedChildren.length) return { kind: "unsupported", label: node.type.replaceAll("_", " "), line };
       if (node.namedChildren.length === 1) return parseExpression(node.namedChildren[0]!);
@@ -356,7 +420,7 @@ function collectSyntaxIssues(root: Node): SyntaxIssue[] {
 }
 
 function containsUnsupportedType(typeNode: Node | undefined, text: string) {
-  if (text.includes("*") || text.includes("&")) return true;
+  if (text.includes("&")) return true;
   if (text.includes("map<") || text.includes("unordered_map<")) return true;
   if (typeNode?.type === "template_type") {
     const base = field(typeNode, "name")?.text ?? "";
@@ -373,7 +437,6 @@ function unsupportedTypeName(typeNode: Node | undefined, text: string) {
 }
 
 function findDeclaredName(node: Node): string {
-  if (node.type === "pointer_declarator" || node.type === "reference_declarator") return "<pointer>";
   if (node.type === "identifier" || node.type === "field_identifier") return node.text;
   for (const child of node.namedChildren) {
     const name = findDeclaredName(child);
