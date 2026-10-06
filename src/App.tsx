@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import Editor from '@monaco-editor/react';
-import { ReactFlow, ReactFlowProvider, useReactFlow, Background, Controls, Handle, Position, type Edge as RFEdge, type EdgeProps, type Node as RFNode, type NodeProps } from '@xyflow/react';
+import { ReactFlow, ReactFlowProvider, useReactFlow, Background, Controls, Handle, Position, BaseEdge, EdgeLabelRenderer, MarkerType, getSmoothStepPath, type Edge as RFEdge, type EdgeProps, type Node as RFNode, type NodeProps } from '@xyflow/react';
 import dagre from 'dagre';
 import '@xyflow/react/dist/style.css';
 import {
@@ -54,11 +54,39 @@ async function decodeSharedState(encoded: string) {
   }
   return state;
 }
-function formatValue(value: unknown) {
+function formatValue(value: unknown, depth = 0): string {
   if (typeof value === 'string') return value.startsWith('[Function: ') ? value : `"${value}"`;
-  if (Array.isArray(value)) return `[${value.map((item) => String(item)).join(', ')}]`;
-  if (value && typeof value === 'object') return JSON.stringify(value);
-  return String(value);
+  if (typeof value === 'symbol') return value.description === 'uninitialized' ? 'uninitialized' : value.description ?? 'symbol';
+  if (value === null || typeof value !== 'object') return String(value);
+  if (Array.isArray(value)) return `[${value.map((item) => formatValue(item, depth + 1)).join(', ')}]`;
+
+  const object = value as Record<string, unknown>;
+  const container = object.__container;
+  if (typeof container === 'string') {
+    const items = Array.isArray(object.items) ? object.items : [];
+    if (container === 'map' || container === 'unordered_map') {
+      const entries = Array.isArray(object.entries) ? object.entries as Array<Record<string, unknown>> : [];
+      const label = container === 'unordered_map' ? 'Hash map' : 'Map';
+      return entries.length
+        ? `${label}\n${entries.map((entry) => `${formatValue(entry.key, depth + 1)} → ${formatValue(entry.value, depth + 1)}`).join('\n')}`
+        : `${label}\n(empty)`;
+    }
+    const labels: Record<string, string> = {
+      queue: 'Queue · front to back',
+      priority_queue: object.__order === 'min' ? 'Min-heap · smallest first' : 'Max-heap · largest first',
+      stack: 'Stack',
+      set: 'Set',
+      unordered_set: 'Set',
+      list: 'List',
+      deque: 'Deque',
+    };
+    return `${labels[container] ?? container}\n${items.length ? `[${items.map((item) => formatValue(item, depth + 1)).join(', ')}]` : '(empty)'}`;
+  }
+
+  const fields = Object.entries(object).filter(([key]) => !key.startsWith('__'));
+  if (!fields.length) return '{}';
+  if (depth >= 5) return '{…}';
+  return `\n${fields.map(([key, fieldValue]) => `${'  '.repeat(depth)}${key}: ${formatValue(fieldValue, depth + 1)}`).join('\n')}`;
 }
 function snapshotValues(snapshot?: TraceSnapshot): Record<string, unknown> {
   const vars = snapshot?.variables;
@@ -588,13 +616,14 @@ function TraceFlowNode({ data, selected }: NodeProps<RFNode<NodeData>>) {
     <Handle type="source" position={Position.Bottom} />
   </div>;
 }
-function TraceFlowEdge({ id, data }: EdgeProps<RFEdge<EdgeData>>) {
+function TraceFlowEdge({ id, data, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, markerEnd }: EdgeProps<RFEdge<EdgeData>>) {
   if (!data) return null;
   const cls = `flow-edge ${data.active ? 'active' : ''} ${data.taken ? 'taken' : ''}`;
-  return <g>
-    <path id={id} className={cls} d={roundedPath(data.points)} markerEnd={data.active ? 'url(#tf-arrow-active)' : 'url(#tf-arrow)'} />
-    {data.label ? <g transform={`translate(${data.lx}, ${data.ly})`}><rect className="edge-label-bg" x={-17} y={-9} width={34} height={18} rx={9} /><text className="edge-label" textAnchor="middle" dominantBaseline="central">{data.label}</text></g> : null}
-  </g>;
+  const [edgePath, labelX, labelY] = getSmoothStepPath({ sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, borderRadius: 10, offset: 18 });
+  return <>
+    <BaseEdge id={id} path={edgePath} className={cls} markerEnd={markerEnd} />
+    {data.label ? <EdgeLabelRenderer><div className="flow-edge-label" style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}>{data.label}</div></EdgeLabelRenderer> : null}
+  </>;
 }
 const flowNodeTypes = { traceNode: TraceFlowNode };
 const flowEdgeTypes = { traceEdge: TraceFlowEdge };
@@ -639,7 +668,8 @@ function FlowInner({ nodes, edges, snapshots, activeSnapshot, errorNodeId, onSel
   });
   const rfEdges: RFEdge<EdgeData>[] = edges.filter((e) => layout.edges.has(e.id)).map((edge) => {
     const l = layout.edges.get(edge.id)!;
-    return { id: edge.id, source: edge.source, target: edge.target, type: 'traceEdge', data: { points: l.points, label: edge.label, lx: l.lx, ly: l.ly, active: edge.source === activeNodeId && edge.target === nextId, taken: takenEdges.has(`${edge.source}>${edge.target}`) } };
+    const active = edge.source === activeNodeId && edge.target === nextId;
+    return { id: edge.id, source: edge.source, target: edge.target, type: 'traceEdge', markerEnd: { type: MarkerType.ArrowClosed, color: active ? 'var(--accent)' : 'var(--edge)' }, data: { points: l.points, label: edge.label, lx: l.lx, ly: l.ly, active, taken: takenEdges.has(`${edge.source}>${edge.target}`) } };
   });
 
   // Fit whenever the chart or its container size changes.
@@ -663,12 +693,6 @@ function FlowInner({ nodes, edges, snapshots, activeSnapshot, errorNodeId, onSel
   }, [activeNodeId, layout, setCenter, getZoom]);
 
   return <div className="flow-stage" ref={hostRef}>
-    <svg width="0" height="0" style={{ position: 'absolute' }} aria-hidden="true">
-      <defs>
-        <marker id="tf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" className="arrow-fill" /></marker>
-        <marker id="tf-arrow-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" className="arrow-fill-active" /></marker>
-      </defs>
-    </svg>
     <ReactFlow nodes={rfNodes} edges={rfEdges} nodeTypes={flowNodeTypes} edgeTypes={flowEdgeTypes} onNodeClick={(_event, node) => onSelect(node.id)} fitView fitViewOptions={{ padding: 0.12, maxZoom: 1.1 }} minZoom={0.15} maxZoom={1.6} proOptions={{ hideAttribution: true }} nodesDraggable={false} nodesConnectable={false} elementsSelectable>
       <Background color="var(--grid)" gap={22} size={1} /><Controls showInteractive={false} />
     </ReactFlow>
@@ -684,7 +708,7 @@ function Inspector({ activeSnapshot, values, prev = {}, arrays, frames, result, 
 }) {
   const tabs: { key: InspectorTab; title: string }[] = [{ key: 'variables', title: 'Variables' }, { key: 'stack', title: 'Call stack' }, { key: 'arrays', title: 'Arrays' }, { key: 'output', title: 'Output' }];
   let content;
-  if (selected === 'variables') content = Object.keys(values).length ? <div className="state-grid">{Object.entries(values).map(([name, value]) => <div className={`state-card ${formatValue(prev[name]) !== formatValue(value) && activeSnapshot ? "changed" : ""}`} key={name} data-testid={`value-variable-${name}`}><span className="state-name">{name}</span><span className="state-value">{formatValue(value)}</span></div>)}</div> : <EmptyInspector icon={<Variable size={17} />} text={result ? 'No local variables in this frame.' : 'Run the program to inspect live values.'} />;
+  if (selected === 'variables') content = Object.keys(values).length ? <div className="state-grid">{Object.entries(values).map(([name, value]) => <div className={`state-card ${formatValue(prev[name]) !== formatValue(value) && activeSnapshot ? "changed" : ""}`} key={name} data-testid={`value-variable-${name}`}><span className="state-name">{name === '$return' ? 'return' : name}</span><span className="state-value">{formatValue(value)}</span></div>)}</div> : <EmptyInspector icon={<Variable size={17} />} text={result ? 'No local variables in this frame.' : 'Run the program to inspect live values.'} />;
   else if (selected === 'stack') content = frames.length ? frames.map((frame, index) => <div className="stack-row" key={index} data-testid={`row-frame-${index}`}><span className="stack-index">{String(index + 1).padStart(2, '0')}</span><span className="stack-name">{String(frame)}</span></div>) : <EmptyInspector icon={<Layers3 size={17} />} text={result ? 'The call stack is empty.' : 'Stack frames appear after execution starts.'} />;
   else if (selected === 'arrays') content = arrays.length ? <div className="array-list">{arrays.map(([name, value]) => { const before = Array.isArray(prev[name]) ? prev[name] as unknown[] : []; return <div className="array-block" key={name} data-testid={`row-array-${name}`}><span className="array-name">{name}<small>[{(value as unknown[]).length}]</small></span><div className="array-cells">{(value as unknown[]).map((item, index) => <div className={`array-cell ${activeSnapshot && String(before[index]) !== String(item) ? 'changed' : ''}`} key={index} data-testid={`cell-${name}-${index}`}><span className="cell-value">{formatValue(item)}</span><span className="cell-index">{index}</span></div>)}</div></div>; })}</div> : <EmptyInspector icon={<Braces size={17} />} text={result ? 'No arrays in this frame.' : 'Arrays show up here as you run the program.'} />;
   else if (nativeRun) content = <>{nativeRun.stdout ? <pre className="output-text" data-testid="text-program-output">{nativeRun.stdout}</pre> : <EmptyInspector icon={<Terminal size={17} />} text={nativeRun.error ? 'Compiler service did not return program output.' : nativeRun.stderr ? 'No standard output. See compiler or runtime diagnostics below.' : 'Native C++ program completed without writing output.'} />}{nativeRun.error || nativeRun.stderr ? <><div className="pane-meta" style={{ marginTop: 12, marginBottom: 6 }}>{nativeRun.error ? 'RUNNER ERROR' : 'COMPILER / STDERR'}</div><pre className="output-text">{nativeRun.error || nativeRun.stderr}</pre></> : null}</>;

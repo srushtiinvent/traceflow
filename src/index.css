@@ -148,7 +148,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .arrow-fill { fill: var(--edge, #6f6a63); }
 .arrow-fill-active { fill: var(--accent); }
 .edge-label-bg { fill: var(--panel); stroke: var(--border); }
-.flow-stage .edge-label { font: 600 10px var(--font-mono); fill: var(--text); }
+.flow-stage .flow-edge-label { position: absolute; z-index: 5; pointer-events: none; padding: 2px 6px; border: 1px solid var(--border); border-radius: 999px; background: var(--panel); color: var(--text); font: 600 10px var(--font-mono); white-space: nowrap; }
 .array-list { display: flex; flex-direction: column; gap: 14px; }
 .array-block { display: flex; flex-direction: column; gap: 7px; }
 .array-name { font: 11px var(--font-mono); color: var(--muted); }
@@ -186,9 +186,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .tab-button.selected { color: var(--text); background: var(--raised); border-color: var(--border); }
 .inspector-body { padding: 13px 15px 16px; min-height: 145px; }
 .state-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(135px,1fr)); gap: 8px; }
-.state-card { min-height: 64px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); }
+.state-card { min-width: 0; min-height: 64px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); }
 .state-name { display: block; color: var(--muted); font: 10px var(--font-mono); margin-bottom: 7px; }
-.state-value { display: block; color: var(--accent); font: 12px var(--font-mono); overflow-wrap: anywhere; }
+.state-value { display: block; max-height: 220px; overflow: auto; white-space: pre-wrap; color: var(--text); font: 12px/1.55 var(--font-mono); overflow-wrap: anywhere; }
 .inspector-empty { display: flex; min-height: 110px; flex-direction: column; align-items: center; justify-content: center; color: var(--muted); text-align: center; gap: 7px; font-size: 11px; }
 .inspector-empty svg { color: var(--accent); opacity: .8; }
 .stack-row, .array-row { display: flex; gap: 11px; align-items: center; padding: 9px 10px; border-bottom: 1px solid var(--border); font: 10px var(--font-mono); }
