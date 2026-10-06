@@ -5,7 +5,7 @@
   "type": "module",
   "description": "TraceFlow: write C++, see a live flowchart, and step through the run.",
   "scripts": {
-    "dev": "vite --host",
+    "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host",
     "test": "tsx --test src/core/traceflow.test.ts",

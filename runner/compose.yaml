@@ -1,0 +1,23 @@
+services:
+  cpp-image:
+    image: traceflow-cpp-runner:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["sh", "-c", "sleep infinity"]
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8787:8787"
+    environment:
+      PORT: 8787
+      TRACEFLOW_CPP_IMAGE: traceflow-cpp-runner:latest
+      TRACEFLOW_SOURCE_DIR: ${TRACEFLOW_SOURCE_DIR:-/var/tmp/traceflow-src}
+      TRACEFLOW_ALLOWED_ORIGINS: ${TRACEFLOW_ALLOWED_ORIGINS:-}
+    volumes:
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      - ${TRACEFLOW_SOURCE_DIR:-/var/tmp/traceflow-src}:${TRACEFLOW_SOURCE_DIR:-/var/tmp/traceflow-src}
+    depends_on:
+      - cpp-image

@@ -168,6 +168,108 @@ int main() {
   assert.deepEqual(result.unusedInput, []);
 });
 
+test("std::queue supports push, front, pop, size, and empty", () => {
+  const source = `#include <iostream>
+#include <queue>
+using namespace std;
+int main() {
+  queue<int> q;
+  q.push(10);
+  q.push(20);
+  cout << q.front() << " " << q.size() << " ";
+  q.pop();
+  cout << q.front() << " " << q.empty() << endl;
+  q.pop();
+  cout << q.empty() << endl;
+  return 0;
+}`;
+  const result = runProgram(source, "");
+  assert.equal(result.error, undefined);
+  assert.equal(result.output, "10 2 20 0\n1\n");
+});
+
+test("stack, deque, priority_queue, and set support common DSA operations", () => {
+  const source = `#include <iostream>
+#include <stack>
+#include <deque>
+#include <queue>
+#include <set>
+using namespace std;
+int main() {
+  stack<int> s; s.push(1); s.push(2); cout << s.top() << " "; s.pop();
+  deque<int> d; d.push_front(2); d.push_back(3); cout << d.front() << d.back() << " "; d.pop_front();
+  priority_queue<int> pq; pq.push(4); pq.push(9); cout << pq.top() << " "; pq.pop();
+  set<int> values; values.insert(7); values.insert(3); values.insert(7);
+  for (int value : values) cout << value;
+  cout << " " << values.count(7) << endl;
+  return 0;
+}`;
+  const result = runProgram(source, "");
+  assert.equal(result.error, undefined);
+  assert.equal(result.output, "2 23 9 37 1\n");
+});
+
+test("unordered_map operator indexing supports graph adjacency lists and frequencies", () => {
+  const source = `#include <iostream>
+#include <unordered_map>
+#include <vector>
+using namespace std;
+int main() {
+  unordered_map<int, vector<int>> graph;
+  graph[1].push_back(2);
+  graph[1].push_back(3);
+  unordered_map<int, int> frequency;
+  frequency[7]++;
+  frequency[7]++;
+  cout << graph[1][0] << graph[1][1] << " " << frequency[7] << " " << graph.size() << endl;
+  return 0;
+}`;
+  const result = runProgram(source, "");
+  assert.equal(result.error, undefined);
+  assert.equal(result.output, "23 2 1\n");
+});
+
+test("priority_queue with greater comparator produces a min-heap ordering", () => {
+  const source = `#include <iostream>
+#include <queue>
+#include <vector>
+using namespace std;
+int main() {
+  int n, val;
+  cin >> n;
+  priority_queue<int, vector<int>, greater<int>> minHeap;
+  for (int i = 0; i < n; ++i) { cin >> val; minHeap.push(val); }
+  while (!minHeap.empty()) {
+    cout << minHeap.top() << (minHeap.size() > 1 ? " " : "");
+    minHeap.pop();
+  }
+  cout << endl;
+  return 0;
+}`;
+  const result = runProgram(source, "6 12 4 5 1 19 8");
+  assert.equal(result.error, undefined);
+  assert.equal(result.output, "1 4 5 8 12 19\n");
+});
+
+test("simple class templates instantiate for concrete argument types", () => {
+  const source = `#include <iostream>
+using namespace std;
+template <typename T>
+class Box {
+  T value;
+public:
+  Box(T initial) : value(initial) {}
+  T get() { return value; }
+};
+int main() {
+  Box<int> box(42);
+  cout << box.get() << endl;
+}`;
+  const result = runProgram(source, "");
+  assert.equal(result.error, undefined);
+  assert.equal(result.output, "42\n");
+});
+
 test("capturing lambdas and vector size constructors run with cin input", () => {
   const source = `#include <iostream>
 #include <vector>
@@ -216,6 +318,29 @@ int main() {
   assert.ok(result.snapshots.some((snapshot) => snapshot.nodeId.startsWith("multiply:")));
   assert.ok(result.snapshots.some((snapshot) => snapshot.variables.multiply === "[Function: multiply]"));
   assert.ok(!zeroResult.snapshots.some((snapshot) => snapshot.nodeId.startsWith("multiply:")));
+});
+
+test("direct vector size construction and reference range-for read every input value", () => {
+  const source = `#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <numeric>
+using namespace std;
+int main() {
+  int n;
+  cin >> n;
+  vector<int> values(n);
+  for (int& value : values) cin >> value;
+  sort(values.begin(), values.end(), [](int a, int b) { return a < b; });
+  for (int value : values) cout << value << " ";
+  cout << accumulate(values.begin(), values.end(), 0);
+  return 0;
+}`;
+  const result = runProgram(source, "5 5 2 4 1 3");
+  assert.equal(result.error, undefined);
+  assert.ok(result.snapshots.length > 5, "trace should continue past vector construction and input");
+  assert.equal(result.output, "1 2 3 4 5 15");
+  assert.deepEqual(result.unusedInput, []);
 });
 
 test("bubble sort produces ordered values", () => {

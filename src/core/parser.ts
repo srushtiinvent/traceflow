@@ -50,7 +50,11 @@ export function parseProgram(source: string): CppProgram {
         const name = field(child, "name")?.text ?? child.namedChildren.find((part) => part.type === "type_identifier")?.text;
         if (name) classes.push(parseClass(child, name));
       } else if (child.type === "template_declaration") {
-        errors.push({ line: lineOf(child), message: "Function and class templates are not supported yet." });
+        const declaration = child.namedChildren.find((part) => part.type === "class_specifier" || part.type === "struct_specifier");
+        if (declaration) {
+          const name = field(declaration, "name")?.text ?? declaration.namedChildren.find((part) => part.type === "type_identifier")?.text;
+          if (name) classes.push(parseClass(declaration, name));
+        }
       } else if (
         child.type === "declaration" &&
         child.namedChildren.some((part) => part.type === "init_declarator" || part.type === "identifier")
@@ -79,12 +83,14 @@ function parseClass(node: Node, name: string): ClassAst {
         if (firstOfType(decl, "pointer_declarator")) variable.type = `${type}*`;
         fields.push(variable);
       }
-    } else if (member.type === "function_definition" || member.type === "declaration") {
-      if (member.type === "function_definition") {
-        const method = parseFunction(member);
+    } else if (member.type === "function_definition" || member.type === "declaration" || member.type === "template_declaration") {
+      const templatedMethod = member.type === "template_declaration" ? member.namedChildren.find((part) => part.type === "function_definition") : undefined;
+      const methodNode = templatedMethod ?? member;
+      if (methodNode.type === "function_definition") {
+        const method = parseFunction(methodNode);
         methods.push(method);
         if (method.name === name) {
-          const initList = member.namedChildren.find((part) => part.type === "field_initializer_list");
+          const initList = methodNode.namedChildren.find((part) => part.type === "field_initializer_list");
           for (const init of initList?.namedChildren ?? []) {
             const fieldName = field(init, "field")?.text ?? init.namedChildren[0]?.text;
             const args = field(init, "arguments")?.namedChildren ?? init.namedChildren.find((part) => part.type === "argument_list")?.namedChildren ?? [];
@@ -193,11 +199,13 @@ function parseStatement(node: Node): Stmt {
       };
     case "for_range_loop": {
       const type = field(node, "type")?.text ?? "auto";
-      const name = field(node, "declarator") ? findDeclaredName(field(node, "declarator")!) : "item";
+      const loopDeclarator = field(node, "declarator");
+      const variableType = loopDeclarator?.type === "reference_declarator" ? `${type}&` : type;
+      const name = loopDeclarator ? findDeclaredName(loopDeclarator) : "item";
       const iterable = field(node, "right") ?? field(node, "range");
       return {
         kind: "rangeFor",
-        variable: { name, type, line },
+        variable: { name, type: variableType, line },
         iterable: parseExpression(iterable ?? node),
         body: field(node, "body") ? parseStatement(field(node, "body")!) : { kind: "empty", line },
         line,
@@ -240,7 +248,8 @@ function parseDeclaration(node: Node): Stmt {
     part.type === "identifier" ||
     part.type === "array_declarator" ||
     part.type === "pointer_declarator" ||
-    part.type === "reference_declarator",
+    part.type === "reference_declarator" ||
+    part.type === "function_declarator",
   );
   const declarations = declarators.map((part) => parseVariableDecl(part, type));
   for (const declaration of declarations) {
@@ -258,13 +267,24 @@ function parseDeclaration(node: Node): Stmt {
 
 function parseVariableDecl(node: Node, type: string): VariableDecl {
   const declarator = node.type === "init_declarator" ? field(node, "declarator") : node;
-  const initializer = node.type === "init_declarator" ? field(node, "value") : undefined;
+  let initializer = node.type === "init_declarator" ? field(node, "value") : undefined;
+  // Tree-sitter can parse direct construction such as vector<int> values(n)
+  // as a function declarator because the single argument is ambiguous with a
+  // function prototype. In a local declaration, treat it as construction.
+  if (declarator?.type === "function_declarator") {
+    const parameters = field(declarator, "parameters");
+    if (parameters) initializer = parameters;
+  }
   const arrayNode = firstOfType(declarator, "array_declarator");
   const arraySizeNode = arrayNode?.namedChildren.find((part) => part.type !== "identifier");
   return {
     name: declarator ? findDeclaredName(declarator) : "<unknown>",
     type,
-    initializer: initializer ? parseExpression(initializer) : undefined,
+    initializer: initializer
+      ? initializer.type === "parameter_list"
+        ? { kind: "list", values: initializer.namedChildren.map((argument) => parseExpression(argument.namedChildren[0] ?? argument)), form: "arguments", line: lineOf(initializer) }
+        : parseExpression(initializer)
+      : undefined,
     arraySize: arraySizeNode ? parseExpression(arraySizeNode) : undefined,
     line: lineOf(node),
   };
@@ -298,6 +318,7 @@ function parseExpression(node: Node): Expr {
       return { kind: "literal", value: decodeQuoted(node.text), line };
     case "identifier":
     case "field_identifier":
+    case "type_identifier":
     case "namespace_identifier":
     case "qualified_identifier":
       return { kind: "identifier", name: node.text, line };
@@ -423,10 +444,8 @@ function collectSyntaxIssues(root: Node): SyntaxIssue[] {
 
 function containsUnsupportedType(typeNode: Node | undefined, text: string) {
   if (text.includes("&")) return true;
-  if (text.includes("map<") || text.includes("unordered_map<")) return true;
   if (typeNode?.type === "template_type") {
-    const base = field(typeNode, "name")?.text ?? "";
-    return base !== "vector";
+    return false;
   }
   return false;
 }

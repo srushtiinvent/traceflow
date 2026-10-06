@@ -15,6 +15,7 @@ import { examples as cppExamples } from './core/examples';
 type MobileView = 'code' | 'flow' | 'visualise';
 type InspectorTab = 'variables' | 'stack' | 'arrays' | 'output';
 type Example = { name: string; description: string; code: string; stdin?: string };
+type NativeRun = { stdout: string; stderr: string; exitCode: number; timedOut?: boolean; error?: string };
 
 const EXAMPLES: Example[] = cppExamples.map((example) => ({
   name: example.name,
@@ -77,6 +78,8 @@ function App() {
   const [stdin, setStdin] = useState(() => readDraft('traceflow-draft-stdin', ''));
   const [graph, setGraph] = useState<ProgramGraph | null>(null);
   const [run, setRun] = useState<RunResult | null>(null);
+  const [nativeRun, setNativeRun] = useState<NativeRun | null>(null);
+  const [nativeRunning, setNativeRunning] = useState(false);
   const [parserReady, setParserReady] = useState(false);
   const [graphError, setGraphError] = useState('');
   const [syntaxIssues, setSyntaxIssues] = useState<Array<{ line: number; message: string }>>([]);
@@ -125,6 +128,9 @@ function App() {
 
   useEffect(() => {
     try { localStorage.setItem('traceflow-draft-stdin', stdin); } catch { /* Storage may be unavailable or full. */ }
+    setNativeRun(null);
+    setRun(null);
+    setCompareRun(null);
   }, [stdin]);
 
   useEffect(() => {
@@ -158,6 +164,8 @@ function App() {
           issue.message.startsWith('Expected ') || issue.message.startsWith('Unexpected token'),
         );
         setRun(null);
+        setCompareRun(null);
+        setNativeRun(null);
         setActiveIndex(0);
         setIsPlaying(false);
         if (syntax.length) {
@@ -235,18 +243,60 @@ function App() {
     if (!result) return;
     const firstAlgorithmStep = result.snapshots.findIndex((snapshot) => {
       const name = snapshot.nodeId.split(':')[0];
-      return name !== 'main' && graph?.functions.some((fn) => fn.name === name);
+      // Skip trivial constructors/accessors (for example Box()) so a helper
+      // object does not become the chart for an otherwise main()-driven run.
+      return name !== 'main' && (graph?.functions.find((fn) => fn.name === name)?.nodes.length ?? 0) > 3;
     });
     const initialNodeId = result.snapshots[firstAlgorithmStep >= 0 ? firstAlgorithmStep : 0]?.nodeId;
     const initialFunction = initialNodeId?.split(':')[0] ?? 'main';
     setRun(result);
+    setNativeRun(null);
+    setCompareRun(null);
     setFunctionName(initialFunction);
+    // Keep one function's chart visible throughout playback. The active step
+    // can enter helper functions without replacing the user's current chart.
     setFollowTraceFunction(false);
     setActiveIndex(firstAlgorithmStep >= 0 ? firstAlgorithmStep : 0);
     setIsPlaying(false);
     setMobileView('visualise');
     notify(`${result.snapshots.length} steps ready`);
   }, [execute, graph, notify, stdin]);
+
+  const compileAndRun = useCallback(async () => {
+    setNativeRunning(true);
+    setNativeRun(null);
+    setRun(null);
+    setCompareRun(null);
+    try {
+      const endpoint = import.meta.env.DEV
+        ? `${window.location.origin}/api/run`
+        : ((import.meta.env.VITE_CPP_RUNNER_URL as string | undefined) || `${window.location.origin}/api/run`);
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ source: sourceRef.current, stdin }),
+      });
+      const responseText = await response.text();
+      let payload: any;
+      try {
+        payload = JSON.parse(responseText);
+      } catch {
+        const detail = responseText.replace(/\s+/g, ' ').trim().slice(0, 300);
+        throw new Error(`Compiler endpoint returned non-JSON (HTTP ${response.status})${detail ? `: ${detail}` : '.'} Check that CPP_RUNNER_URL points to the runner's /api/run endpoint.`);
+      }
+      if (!response.ok) throw new Error(payload.error || `Compiler service returned ${response.status}.`);
+      setNativeRun(payload as NativeRun);
+      setMobileView('visualise');
+      setInspectorTab('output');
+      notify(payload.exitCode === 0 ? 'C++ program finished' : 'C++ program exited with an error');
+    } catch (error) {
+      setNativeRun({ stdout: '', stderr: '', exitCode: 1, error: error instanceof Error ? error.message : 'Could not reach the compiler service.' });
+      setMobileView('visualise');
+      notify('Could not run with the C++ compiler');
+    } finally {
+      setNativeRunning(false);
+    }
+  }, [stdin, notify]);
 
   const step = (direction: number) => {
     setIsPlaying(false);
@@ -321,16 +371,38 @@ function App() {
   };
 
   const compare = () => {
-    const resultA = execute(source, stdin);
+    const resultA = execute(sourceRef.current, stdin);
     const resultB = execute(compareSource, stdin);
     if (resultA && resultB) {
       setRun(resultA);
+      setNativeRun(null);
       setCompareRun(resultB);
       setActiveIndex(0);
       setIsPlaying(false);
-      notify('Both traces ran with the same input');
+      const status = resultA.error || resultB.error ? 'Comparison finished with a runtime error' : 'Both traces ran with the same input';
+      notify(status);
     }
   };
+  useEffect(() => { setCompareRun(null); }, [compareSource]);
+  const comparisonSummary = useMemo(() => {
+    if (!run || !compareRun) return null;
+    const firstDifference = (() => {
+      const count = Math.min(run.snapshots.length, compareRun.snapshots.length);
+      for (let index = 0; index < count; index += 1) {
+        const left = run.snapshots[index];
+        const right = compareRun.snapshots[index];
+        if (left.line !== right.line || left.nodeId !== right.nodeId || left.output !== right.output || JSON.stringify(left.variables) !== JSON.stringify(right.variables)) return index + 1;
+      }
+      return run.snapshots.length === compareRun.snapshots.length ? null : count + 1;
+    })();
+    return {
+      outputMatches: run.output === compareRun.output,
+      traceMatches: firstDifference === null,
+      firstDifference,
+      leftError: run.error ? `Line ${run.error.line}: ${run.error.message}` : '',
+      rightError: compareRun.error ? `Line ${compareRun.error.line}: ${compareRun.error.message}` : '',
+    };
+  }, [run, compareRun]);
   const variables = Object.entries(values);
   const arrayVariables = variables.filter(([, value]) => Array.isArray(value));
   const frameList = activeSnapshot?.frames ?? [];
@@ -360,6 +432,7 @@ function App() {
             <button className="quiet-button" onClick={() => { setCompareOpen((current) => !current); if (!compareSource) setCompareSource(source); }} data-testid="button-compare"><Layers3 size={14} /><span>Compare</span></button>
             <button className="quiet-button" onClick={shareCode} data-testid="button-share"><Copy size={14} /><span>Share</span></button>
             <button className="quiet-button" onClick={exportPng} data-testid="button-export"><ArrowDownToLine size={14} /><span>PNG</span></button>
+            <button className="quiet-button" onClick={compileAndRun} disabled={nativeRunning} data-testid="button-compile-run"><Terminal size={13} /> {nativeRunning ? 'Compiling…' : 'Compile & run'}</button>
             <button className="primary-button" onClick={runCurrent} data-testid="button-run"><Play size={13} fill="currentColor" /> Visualise <span className="pane-meta">⌘ ↵</span></button>
           </div>
         </div>
@@ -409,16 +482,17 @@ function App() {
                 <div className="flow-empty"><div className="empty-content"><div className="empty-glyph"><GitBranch size={22} /></div><h2>{graphMessages ? 'Fix this to continue' : 'Your flowchart appears here'}</h2><p>{graphMessages || 'Write some C++ on the left and its flowchart appears here. Press Visualise to watch it run step by step.'}</p></div></div>}
             </div>
             {graphMessages && nodes.length > 0 ? <div className="run-alert" data-testid="status-syntax-issues">{graphMessages}</div> : null}
+            {nativeRun && !run ? <div className="run-info" data-testid="status-native-run-chart">Native C++ completed. This chart shows the program structure; native compilation does not capture step-by-step variable states. Use Visualise for an interpreter trace of the supported subset.</div> : null}
           </section>
         </section>
 
-        <div className="mobile-visualiser"><Inspector activeSnapshot={activeSnapshot} values={values} prev={prevValues} arrays={arrayVariables} frames={frameList} result={run} selected={inspectorTab} onSelect={setInspectorTab} /></div>
+        <div className="mobile-visualiser"><Inspector activeSnapshot={activeSnapshot} values={values} prev={prevValues} arrays={arrayVariables} frames={frameList} result={run} nativeRun={nativeRun} selected={inspectorTab} onSelect={setInspectorTab} /></div>
         <section className="lower-grid">
-          <Inspector activeSnapshot={activeSnapshot} values={values} prev={prevValues} arrays={arrayVariables} frames={frameList} result={run} selected={inspectorTab} onSelect={setInspectorTab} />
-          {compareOpen ? <div className="surface compare-panel"><div className="compare-head"><h3>Compare traces</h3><div><button className="primary-button" onClick={compare} data-testid="button-run-compare"><Play size={12} /> Run comparison</button><button className="icon-button" onClick={() => setCompareOpen(false)} aria-label="Close comparison" data-testid="button-close-compare"><X size={14} /></button></div></div><textarea aria-label="Comparison source code" value={compareSource} onChange={(event) => setCompareSource(event.target.value)} data-testid="input-compare-code" /><div className="compare-diff">{compareRun ? `Output ${compareRun.output === (run?.output ?? '') ? 'matches' : 'differs'} · ${snapshots.length} vs ${compareRun.snapshots.length} snapshots\n\nOriginal output:\n${run?.output || '(empty)'}\n\nComparison output:\n${compareRun.output || '(empty)'}` : 'Edit a second version of the program, then run both traces to compare their output and step counts.'}</div></div> :
+          <Inspector activeSnapshot={activeSnapshot} values={values} prev={prevValues} arrays={arrayVariables} frames={frameList} result={run} nativeRun={nativeRun} selected={inspectorTab} onSelect={setInspectorTab} />
+          {compareOpen ? <div className="surface compare-panel"><div className="compare-head"><h3>Compare traces</h3><div><button className="primary-button" onClick={compare} data-testid="button-run-compare"><Play size={12} /> Run comparison</button><button className="icon-button" onClick={() => setCompareOpen(false)} aria-label="Close comparison" data-testid="button-close-compare"><X size={14} /></button></div></div><p className="modal-hint">Both programs run in the visualiser with the same standard input. Native Compile &amp; run output is not part of trace comparison.</p><textarea aria-label="Comparison source code" value={compareSource} onChange={(event) => setCompareSource(event.target.value)} data-testid="input-compare-code" /><div className="compare-diff" data-testid="text-compare-results">{comparisonSummary ? `Trace: ${comparisonSummary.traceMatches ? 'same path and state at every step' : `first difference at step ${comparisonSummary.firstDifference}`}\nOutput: ${comparisonSummary.outputMatches ? 'matches' : 'differs'}\nSteps: ${run?.snapshots.length ?? 0} vs ${compareRun?.snapshots.length ?? 0}\nInput used for both: ${stdin.trim() || '(empty)'}${comparisonSummary.leftError ? `\nProgram A error: ${comparisonSummary.leftError}` : ''}${comparisonSummary.rightError ? `\nProgram B error: ${comparisonSummary.rightError}` : ''}\n\nProgram A output:\n${run?.output || '(empty)'}\n\nProgram B output:\n${compareRun?.output || '(empty)'}` : 'Edit a second version of the program, then run both traces to compare their output, executed path, variables, and step counts.'}</div></div> :
             <div className="surface compare-panel">
-              <div className="pane-head"><div className="pane-label"><Activity size={15} /> Execution</div><span className="pane-meta">{run ? `${snapshots.length} captured steps` : 'Waiting for run'}</span></div>
-              <div className="inspector-body">{run ? <><div className="state-grid"><div className="state-card"><span className="state-name">TRACE STATUS</span><span className="state-value">{run.error ? 'Runtime error' : 'Completed'}</span></div><div className="state-card"><span className="state-name">CURRENT STEP</span><span className="state-value">{snapshots.length ? `${activeIndex + 1} / ${snapshots.length}` : '—'}</span></div><div className="state-card"><span className="state-name">SOURCE LINE</span><span className="state-value">{activeLine || '—'}</span></div></div><div className="pane-meta" style={{ marginTop: 10 }}>INPUT USED · {stdin.trim() || '(empty)'}</div>{run.unusedInput?.length ? <div className="pane-meta" style={{ marginTop: 6 }}>UNUSED INPUT · {run.unusedInput.join(' ')}</div> : null}<div className="pane-meta" style={{ marginTop: 12, marginBottom: 6 }}>PROGRAM OUTPUT</div><pre className="output-text" data-testid="text-program-output">{run.output || '(no output)'}</pre>{run.error ? <div className="inspector-empty" style={{ minHeight: 32, alignItems: 'flex-start' }}>{run.error.message}</div> : null}</> : <div className="inspector-empty"><Activity size={18} /><span>Execution state will appear here when you run the program.</span></div>}</div>
+              <div className="pane-head"><div className="pane-label"><Activity size={15} /> Execution</div><span className="pane-meta">{nativeRun ? 'Compiler run' : run ? `${snapshots.length} captured steps` : 'Waiting for run'}</span></div>
+              <div className="inspector-body">{nativeRun ? <><div className="state-grid"><div className="state-card"><span className="state-name">PROGRAM STATUS</span><span className="state-value">{nativeRun.error ? 'Service error' : nativeRun.timedOut ? 'Timed out' : `Exit ${nativeRun.exitCode}`}</span></div><div className="state-card"><span className="state-name">EXECUTION</span><span className="state-value">Native C++</span></div><div className="state-card"><span className="state-name">INPUT</span><span className="state-value">{stdin ? 'Provided' : 'Empty'}</span></div></div><div className="pane-meta" style={{ marginTop: 12, marginBottom: 6 }}>PROGRAM OUTPUT</div><pre className="output-text" data-testid="text-program-output">{nativeRun.stdout || '(no output)'}</pre>{nativeRun.error || nativeRun.stderr ? <><div className="pane-meta" style={{ marginTop: 12, marginBottom: 6 }}>{nativeRun.error ? 'RUNNER ERROR' : 'COMPILER / STDERR'}</div><pre className="output-text">{nativeRun.error || nativeRun.stderr}</pre></> : null}</> : run ? <><div className="state-grid"><div className="state-card"><span className="state-name">TRACE STATUS</span><span className="state-value">{run.error ? 'Runtime error' : 'Completed'}</span></div><div className="state-card"><span className="state-name">CURRENT STEP</span><span className="state-value">{snapshots.length ? `${activeIndex + 1} / ${snapshots.length}` : '—'}</span></div><div className="state-card"><span className="state-name">SOURCE LINE</span><span className="state-value">{activeLine || '—'}</span></div></div><div className="pane-meta" style={{ marginTop: 10 }}>INPUT USED · {stdin.trim() || '(empty)'}</div>{run.unusedInput?.length ? <div className="pane-meta" style={{ marginTop: 6 }}>UNUSED INPUT · {run.unusedInput.join(' ')}</div> : null}<div className="pane-meta" style={{ marginTop: 12, marginBottom: 6 }}>PROGRAM OUTPUT</div><pre className="output-text" data-testid="text-program-output">{run.output || '(no output)'}</pre>{run.error ? <div className="inspector-empty" style={{ minHeight: 32, alignItems: 'flex-start' }}>{run.error.message}</div> : null}</> : <div className="inspector-empty"><Activity size={18} /><span>Run with Compile &amp; run for C++ output, or Visualise for a supported step-by-step trace.</span></div>}</div>
             </div>}
         </section>
       </main>
@@ -435,7 +509,7 @@ function App() {
         <button className="icon-button mobile-inspector-open" onClick={() => setSheetOpen(true)} aria-label="Open inspectors" data-testid="button-open-inspector"><Variable size={15} /></button>
       </div>
 
-      {sheetOpen ? <><button className="sheet-scrim" aria-label="Close inspector" onClick={() => setSheetOpen(false)} data-testid="button-close-inspector-scrim" /><Inspector activeSnapshot={activeSnapshot} values={values} prev={prevValues} arrays={arrayVariables} frames={frameList} result={run} selected={inspectorTab} onSelect={setInspectorTab} sheet onClose={() => setSheetOpen(false)} /></> : null}
+      {sheetOpen ? <><button className="sheet-scrim" aria-label="Close inspector" onClick={() => setSheetOpen(false)} data-testid="button-close-inspector-scrim" /><Inspector activeSnapshot={activeSnapshot} values={values} prev={prevValues} arrays={arrayVariables} frames={frameList} result={run} nativeRun={nativeRun} selected={inspectorTab} onSelect={setInspectorTab} sheet onClose={() => setSheetOpen(false)} /></> : null}
 
       {showExamples ? <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowExamples(false); }}><div className="modal"><div className="modal-head"><h2>Start with an example</h2><button className="icon-button" aria-label="Close examples" onClick={() => setShowExamples(false)} data-testid="button-close-examples"><X size={15} /></button></div>{EXAMPLES.map((example) => <button key={example.name} className="example-item" onClick={() => loadExample(example)} data-testid={`button-example-${example.name.toLowerCase().replaceAll(' ', '-')}`}><span><b>{example.name}</b><small>{example.description}</small></span><ChevronDown size={14} /></button>)}</div></div> : null}
       {stdinOpen ? <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setStdinOpen(false); }}><div className="modal"><div className="modal-head"><h2>Program input</h2><button className="icon-button" aria-label="Close input" onClick={() => setStdinOpen(false)} data-testid="button-close-stdin"><X size={15} /></button></div><p className="modal-hint">Lines here are passed to the program as standard input.</p><textarea aria-label="Standard input" value={stdin} onChange={(event) => setStdin(event.target.value)} placeholder="Enter input, one line at a time…" data-testid="input-stdin" /><div className="modal-actions"><button className="quiet-button" onClick={() => setStdin('')} data-testid="button-clear-stdin">Clear</button><button className="primary-button" onClick={() => setStdinOpen(false)} data-testid="button-save-stdin"><Check size={13} /> Done</button></div></div></div> : null}
@@ -605,16 +679,17 @@ function FlowChart(props: Parameters<typeof FlowInner>[0]) {
   return <ReactFlowProvider><FlowInner {...props} /></ReactFlowProvider>;
 }
 
-function Inspector({ activeSnapshot, values, prev = {}, arrays, frames, result, selected, onSelect, sheet = false, onClose }: {
+function Inspector({ activeSnapshot, values, prev = {}, arrays, frames, result, nativeRun, selected, onSelect, sheet = false, onClose }: {
   activeSnapshot?: TraceSnapshot; values: Record<string, unknown>; prev?: Record<string, unknown>; arrays: Array<[string, unknown]>;
-  frames: unknown[]; result: RunResult | null; selected: InspectorTab; onSelect: (tab: InspectorTab) => void; sheet?: boolean; onClose?: () => void;
+  frames: unknown[]; result: RunResult | null; nativeRun?: NativeRun | null; selected: InspectorTab; onSelect: (tab: InspectorTab) => void; sheet?: boolean; onClose?: () => void;
 }) {
   const tabs: { key: InspectorTab; title: string }[] = [{ key: 'variables', title: 'Variables' }, { key: 'stack', title: 'Call stack' }, { key: 'arrays', title: 'Arrays' }, { key: 'output', title: 'Output' }];
   let content;
   if (selected === 'variables') content = Object.keys(values).length ? <div className="state-grid">{Object.entries(values).map(([name, value]) => <div className={`state-card ${formatValue(prev[name]) !== formatValue(value) && activeSnapshot ? "changed" : ""}`} key={name} data-testid={`value-variable-${name}`}><span className="state-name">{name}</span><span className="state-value">{formatValue(value)}</span></div>)}</div> : <EmptyInspector icon={<Variable size={17} />} text={result ? 'No local variables in this frame.' : 'Run the program to inspect live values.'} />;
   else if (selected === 'stack') content = frames.length ? frames.map((frame, index) => <div className="stack-row" key={index} data-testid={`row-frame-${index}`}><span className="stack-index">{String(index + 1).padStart(2, '0')}</span><span className="stack-name">{String(frame)}</span></div>) : <EmptyInspector icon={<Layers3 size={17} />} text={result ? 'The call stack is empty.' : 'Stack frames appear after execution starts.'} />;
   else if (selected === 'arrays') content = arrays.length ? <div className="array-list">{arrays.map(([name, value]) => { const before = Array.isArray(prev[name]) ? prev[name] as unknown[] : []; return <div className="array-block" key={name} data-testid={`row-array-${name}`}><span className="array-name">{name}<small>[{(value as unknown[]).length}]</small></span><div className="array-cells">{(value as unknown[]).map((item, index) => <div className={`array-cell ${activeSnapshot && String(before[index]) !== String(item) ? 'changed' : ''}`} key={index} data-testid={`cell-${name}-${index}`}><span className="cell-value">{formatValue(item)}</span><span className="cell-index">{index}</span></div>)}</div></div>; })}</div> : <EmptyInspector icon={<Braces size={17} />} text={result ? 'No arrays in this frame.' : 'Arrays show up here as you run the program.'} />;
-  else content = result?.output ? <div className="output-text" data-testid="text-program-output">{result.output}</div> : <EmptyInspector icon={<Terminal size={17} />} text={result ? 'Program completed without writing output.' : 'Program output will appear here.'} />;
+  else if (nativeRun) content = <>{nativeRun.stdout ? <pre className="output-text" data-testid="text-program-output">{nativeRun.stdout}</pre> : <EmptyInspector icon={<Terminal size={17} />} text={nativeRun.error ? 'Compiler service did not return program output.' : nativeRun.stderr ? 'No standard output. See compiler or runtime diagnostics below.' : 'Native C++ program completed without writing output.'} />}{nativeRun.error || nativeRun.stderr ? <><div className="pane-meta" style={{ marginTop: 12, marginBottom: 6 }}>{nativeRun.error ? 'RUNNER ERROR' : 'COMPILER / STDERR'}</div><pre className="output-text">{nativeRun.error || nativeRun.stderr}</pre></> : null}</>;
+  else content = result?.output ? <div className="output-text" data-testid="text-program-output">{result.output}</div> : <EmptyInspector icon={<Terminal size={17} />} text={result ? 'Visualise finished without writing output.' : 'Program output will appear here.'} />;
   return <div className={`surface inspector ${sheet ? 'sheet' : ''}`} aria-label="Execution inspectors">
     <div className="inspector-tabs">{tabs.map((tab) => <button key={tab.key} className={`tab-button ${selected === tab.key ? 'selected' : ''}`} onClick={() => onSelect(tab.key)} data-testid={`tab-inspector-${tab.key}`}>{tab.title}</button>)}{sheet && onClose ? <button className="icon-button" style={{ marginLeft: 'auto' }} aria-label="Close inspector" onClick={onClose} data-testid="button-close-inspector"><X size={14} /></button> : null}</div>
     <div className="inspector-body">{activeSnapshot ? <div className="pane-meta" style={{ marginBottom: 10 }}>{activeSnapshot.line ? `LINE ${activeSnapshot.line}` : 'STEP'}{activeSnapshot.changes?.length ? ` · ${activeSnapshot.changes.slice(0, 3).join(', ')}` : ''}</div> : null}{content}</div>

@@ -178,6 +178,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .empty-content h2 { font: 24px var(--font-serif); margin: 0 0 6px; }
 .empty-content p { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 0; }
 .run-alert { padding: 9px 13px; color: #B46A72; background: color-mix(in srgb, var(--error) 18%, var(--panel)); border-top: 1px solid color-mix(in srgb, #B46A72 30%, var(--border)); font: 10px/1.5 var(--font-mono); }
+.run-info { padding: 9px 13px; color: var(--muted); background: var(--panel); border-top: 1px solid var(--border); font: 10px/1.5 var(--font-mono); }
 .lower-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(285px, .65fr); gap: 14px; margin-top: 14px; }
 .inspector { min-height: 213px; }
 .inspector-tabs { height: 45px; padding: 0 12px; display: flex; align-items: center; gap: 4px; border-bottom: 1px solid var(--border); }

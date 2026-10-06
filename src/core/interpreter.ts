@@ -19,8 +19,10 @@ type Frame = {
 type Location =
   | { kind: "variable"; vars: Map<string, unknown>; name: string }
   | { kind: "property"; object: Record<string, unknown>; name: string }
-  | { kind: "cell"; array: unknown[]; index: number; name: string };
+  | { kind: "cell"; array: unknown[]; index: number; name: string }
+  | { kind: "mapEntry"; map: { entries: Array<{ key: unknown; value: unknown }> }; key: unknown; name: string };
 type RuntimeLambda = { __traceflowLambda: true; fn: FunctionAst };
+type RuntimeIterator = { __traceflowIterator: true; array: unknown[]; index: number };
 
 class RuntimeFault extends Error {
   constructor(message: string, readonly line: number) {
@@ -143,19 +145,24 @@ export function runProgram(source: string, stdin: string): RunResult {
           if (!frame) return fault("Variable declaration is outside a function.", declaration.line);
           const scope = currentScope(frame);
           if (scope.vars.has(declaration.name)) return fault(`“${declaration.name}” is already declared in this scope.`, declaration.line);
-          let value: unknown = classes.has(declaration.type.replace(/\*+$/, "")) ? makeObject(declaration.type.replace(/\*+$/, "")) : defaultValue(declaration.type);
+          const declaredClass = classTypeName(declaration.type);
+          let value: unknown = classes.has(declaredClass) ? makeObject(declaredClass) : defaultValue(declaration.type);
           if (declaration.arraySize) {
             const size = toNumber(evaluate(declaration.arraySize));
             if (!Number.isInteger(size) || size < 0 || size > 100_000) return fault("Array size must be a non-negative integer no greater than 100,000.", declaration.line);
             value = Array.from({ length: size }, () => defaultValue(arrayElementType(declaration.type)));
           }
           if (declaration.initializer) {
+            if (classes.has(declaredClass) && declaration.initializer.kind === "list" && declaration.initializer.form === "arguments") {
+              construct(value, declaredClass, declaration.initializer.values.map(evaluate), declaration.line);
+            } else {
             const initial = evaluate(declaration.initializer);
             if (declaration.type.includes("vector") && declaration.initializer.kind === "list" && declaration.initializer.form === "arguments" && Array.isArray(initial) && typeof initial[0] === "number") {
               const size = toNumber(initial[0]);
               if (!Number.isInteger(size) || size < 0 || size > 100_000) return fault("Vector size must be a non-negative integer no greater than 100,000.", declaration.line);
               value = Array.from({ length: size }, () => clone(initial.length > 1 ? initial[1] : defaultValue(arrayElementType(declaration.type))));
             } else value = Array.isArray(initial) ? clone(initial) : initial;
+            }
           }
           scope.vars.set(declaration.name, value);
           scope.types.set(declaration.name, declaration.type);
@@ -228,7 +235,7 @@ export function runProgram(source: string, stdin: string): RunResult {
       }
       case "rangeFor": {
         const values = evaluate(statement.iterable);
-        if (!Array.isArray(values) && typeof values !== "string") {
+        if (!Array.isArray(values) && typeof values !== "string" && !isStdContainer(values) && !isStdMap(values)) {
           fault("A range-for loop needs an array, vector, or string.", statement.line);
         }
         const frame = currentFrame();
@@ -236,7 +243,9 @@ export function runProgram(source: string, stdin: string): RunResult {
         const rangeScope = { vars: new Map<string, unknown>(), types: new Map<string, string>() };
         frame.scopes.push(rangeScope);
         rangeScope.types.set(statement.variable.name, statement.variable.type);
-        for (const value of values as Iterable<unknown>) {
+        const iterable = isStdContainer(values) ? values.items : isStdMap(values) ? values.entries.map((entry) => ({ first: entry.key, second: entry.value })) : values as Iterable<unknown>;
+        let rangeIndex = 0;
+        for (const value of iterable) {
           rangeScope.vars.set(statement.variable.name, value);
           changes.add(statement.variable.name);
           record(statement.line);
@@ -245,7 +254,14 @@ export function runProgram(source: string, stdin: string): RunResult {
           } catch (signal) {
             if (signal instanceof FlowSignal && signal.type === "break") break;
             if (!(signal instanceof FlowSignal && signal.type === "continue")) throw signal;
+          } finally {
+            // A reference range variable aliases its element in C++. Reflect
+            // assignments (including cin >> value) back into the source vector.
+            if (statement.variable.type.includes("&") && Array.isArray(values)) {
+              values[rangeIndex] = clone(rangeScope.vars.get(statement.variable.name));
+            }
           }
+          rangeIndex += 1;
         }
         frame.scopes.pop();
         record(statement.line);
@@ -295,6 +311,17 @@ export function runProgram(source: string, stdin: string): RunResult {
       case "index": {
         const object = evaluate(expression.object);
         const index = evaluate(expression.index);
+        if (isStdMap(object)) {
+          const entry = object.entries.find((candidate) => candidate.key === index);
+          if (entry) return entry.value;
+          const rootName = expression.object.kind === "identifier" ? expression.object.name : "";
+          const type = rootName ? typeOfVariable(rootName) ?? "" : "";
+          const mappedType = mapValueType(type);
+          const value = mappedType ? defaultValue(mappedType) : undefined;
+          object.entries.push({ key: index, value });
+          changes.add(`${rootName}[${format(index)}]`);
+          return value;
+        }
         const numeric = toNumber(index);
         if (!Number.isInteger(numeric)) fault("An array index must be an integer.", expression.line);
         if (!Array.isArray(object) && typeof object !== "string") return fault("Only arrays, vectors, and strings can be indexed.", expression.line);
@@ -371,6 +398,7 @@ export function runProgram(source: string, stdin: string): RunResult {
       case "call": {
         const args = expression.args.map(evaluate);
         const name = expression.callee;
+        const builtinName = name.includes("::") ? name.slice(name.lastIndexOf("::") + 2) : name;
         if (name.startsWith("new:")) {
           const typeName = name.slice(4);
           if (!classes.has(typeName)) return fault(`Cannot allocate unknown type “${typeName}”.`, expression.line);
@@ -389,10 +417,43 @@ export function runProgram(source: string, stdin: string): RunResult {
         const receiver = lastSeparator >= 0 ? args[0] : undefined;
         const callArgs = lastSeparator >= 0 ? args.slice(1) : args;
         if (lastSeparator >= 0) return callMethod(receiver, method, callArgs, expression.line);
-        switch (name) {
+        switch (builtinName) {
           case "min": return Math.min(...callArgs.map(toNumber));
           case "max": return Math.max(...callArgs.map(toNumber));
           case "abs": return Math.abs(toNumber(callArgs[0]));
+          case "sort": {
+            const first = callArgs[0];
+            const last = callArgs[1];
+            if (!isRuntimeIterator(first) || !isRuntimeIterator(last) || first.array !== last.array) {
+              return fault("sort() expects begin/end iterators from the same vector.", expression.line);
+            }
+            const compare = callArgs[2];
+            const values = first.array.slice(first.index, last.index);
+            values.sort((left, right) => {
+              if (compare && typeof compare === "object" && "__traceflowLambda" in compare) {
+                return truthy(executeLambda(compare as RuntimeLambda, [left, right], expression.line)) ? -1 : 1;
+              }
+              return toNumber(left) - toNumber(right);
+            });
+            first.array.splice(first.index, values.length, ...values);
+            changes.add(nameOfValue(first.array));
+            return undefined;
+          }
+          case "accumulate": {
+            const first = callArgs[0];
+            const last = callArgs[1];
+            if (!isRuntimeIterator(first) || !isRuntimeIterator(last) || first.array !== last.array) {
+              return fault("accumulate() expects begin/end iterators from the same vector.", expression.line);
+            }
+            let result: unknown = callArgs[2] ?? 0;
+            const operation = callArgs[3];
+            for (const value of first.array.slice(first.index, last.index)) {
+              if (operation && typeof operation === "object" && "__traceflowLambda" in operation) {
+                result = executeLambda(operation as RuntimeLambda, [result, value], expression.line);
+              } else result = applyOperator("+", result, value, expression.line);
+            }
+            return result;
+          }
           case "vector": {
             const size = toNumber(callArgs[0]);
             if (!Number.isInteger(size) || size < 0 || size > 100_000) return fault("Vector size must be a non-negative integer no greater than 100,000.", expression.line);
@@ -446,6 +507,10 @@ export function runProgram(source: string, stdin: string): RunResult {
     }
     if (expression.kind === "index") {
       const object = evaluate(expression.object);
+      if (isStdMap(object)) {
+        const key = evaluate(expression.index);
+        return { kind: "mapEntry", map: object, key, name: `${expressionText(expression.object)}[${format(key)}]` };
+      }
       if (!Array.isArray(object)) return fault("Only arrays and vectors can be assigned through an index.", line);
       const index = toNumber(evaluate(expression.index));
       if (!Number.isInteger(index) || index < 0 || index >= object.length) {
@@ -462,6 +527,10 @@ export function runProgram(source: string, stdin: string): RunResult {
       return value;
     }
     if (location.kind === "property") { reads.add(location.name); return location.object[location.name]; }
+    if (location.kind === "mapEntry") {
+      reads.add(location.name);
+      return location.map.entries.find((entry) => entry.key === location.key)?.value;
+    }
     reads.add(location.name);
     return location.array[location.index];
   };
@@ -471,6 +540,11 @@ export function runProgram(source: string, stdin: string): RunResult {
       changes.add(location.name);
     } else if (location.kind === "property") {
       location.object[location.name] = value;
+      changes.add(location.name);
+    } else if (location.kind === "mapEntry") {
+      const entry = location.map.entries.find((candidate) => candidate.key === location.key);
+      if (entry) entry.value = value;
+      else location.map.entries.push({ key: location.key, value });
       changes.add(location.name);
     } else {
       location.array[location.index] = value;
@@ -525,6 +599,84 @@ export function runProgram(source: string, stdin: string): RunResult {
       const type = classes.get(typeName);
       const fn = type?.methods.find((candidate) => candidate.name === method);
       if (fn) return executeMethod(fn, receiver, args, line);
+    }
+    if (isStdMap(receiver)) {
+      const entries = receiver.entries;
+      if (method === "size") return entries.length;
+      if (method === "empty") return entries.length === 0;
+      if (method === "clear") { entries.length = 0; changes.add(nameOfValue(receiver)); return undefined; }
+      if (method === "count" || method === "contains") {
+        const found = entries.some((entry) => entry.key === args[0]);
+        return method === "contains" ? found : Number(found);
+      }
+      if (method === "erase") {
+        const index = entries.findIndex((entry) => entry.key === args[0]);
+        if (index >= 0) entries.splice(index, 1);
+        changes.add(nameOfValue(receiver));
+        return undefined;
+      }
+      if (method === "insert") {
+        const pair = args[0];
+        if (!Array.isArray(pair) || pair.length < 2) return fault(`${receiver.__container}.insert() expects a key/value pair.`, line);
+        if (!entries.some((entry) => entry.key === pair[0])) entries.push({ key: pair[0], value: pair[1] });
+        changes.add(nameOfValue(receiver));
+        return undefined;
+      }
+      return fault(`${receiver.__container} method “${method}” is not supported yet.`, line);
+    }
+    if (isStdContainer(receiver)) {
+      const items = receiver.items;
+      const kind = receiver.__container;
+      const label = kind;
+      if (method === "size") return items.length;
+      if (method === "empty") return items.length === 0;
+      if (method === "push" || method === "push_back" || method === "push_front") {
+        if (args.length !== 1) return fault(`${label}.${method}() expects one value.`, line);
+        const value = args[0];
+        if (kind === "set" || kind === "unordered_set") {
+          if (!items.some((item) => item === value)) items.push(value);
+        } else if (kind === "priority_queue") {
+          items.push(value);
+          items.sort((a, b) => receiver.__order === "min" ? toNumber(a) - toNumber(b) : toNumber(b) - toNumber(a));
+        } else if ((method === "push_front" || kind === "stack") && kind !== "queue") items.unshift(value);
+        else items.push(value);
+        changes.add(nameOfValue(receiver));
+        return undefined;
+      }
+      if (method === "pop" || method === "pop_back" || method === "pop_front") {
+        if (!items.length) return fault(`${label}.${method}() cannot be used on an empty container.`, line);
+        if (kind === "queue" || method === "pop_front") items.shift();
+        else if (kind === "stack" || kind === "priority_queue") items.shift();
+        else items.pop();
+        changes.add(nameOfValue(receiver));
+        return undefined;
+      }
+      if (method === "front" || method === "back" || method === "top") {
+        if (!items.length) return fault(`${label}.${method}() cannot be used on an empty container.`, line);
+        if (kind === "stack" || kind === "priority_queue") return items[0];
+        return method === "front" ? items[0] : items.at(-1);
+      }
+      if (method === "insert" && (kind === "set" || kind === "unordered_set")) {
+        if (args.length !== 1) return fault(`${label}.insert() expects one value.`, line);
+        if (!items.some((item) => item === args[0])) items.push(args[0]);
+        items.sort((a, b) => toNumber(a) - toNumber(b));
+        changes.add(nameOfValue(receiver));
+        return undefined;
+      }
+      if ((method === "count" || method === "contains") && (kind === "set" || kind === "unordered_set")) {
+        const found = items.includes(args[0]);
+        return method === "contains" ? found : Number(found);
+      }
+      if (method === "erase" && (kind === "set" || kind === "unordered_set")) {
+        const index = items.indexOf(args[0]);
+        if (index >= 0) items.splice(index, 1);
+        changes.add(nameOfValue(receiver));
+        return undefined;
+      }
+      return fault(`${label} method “${method}” is not supported yet.`, line);
+    }
+    if (Array.isArray(receiver) && (method === "begin" || method === "end")) {
+      return { __traceflowIterator: true, array: receiver, index: method === "begin" ? 0 : receiver.length } satisfies RuntimeIterator;
     }
     if (method === "size" || method === "length") {
       if (Array.isArray(receiver) || typeof receiver === "string") return receiver.length;
@@ -681,12 +833,21 @@ export function runProgram(source: string, stdin: string): RunResult {
 
 function defaultValue(type: string): unknown {
   if (type.trimEnd().endsWith("*")) return null;
+  if (type.includes("unordered_map")) return { __container: "unordered_map", entries: [] as Array<{ key: unknown; value: unknown }> };
+  if (type.includes("map")) return { __container: "map", entries: [] as Array<{ key: unknown; value: unknown }> };
+  for (const container of ["priority_queue", "unordered_set", "queue", "stack", "deque", "set"]) {
+    if (type.includes(container)) return { __container: container, __order: container === "priority_queue" && type.includes("greater") ? "min" : "max", items: [] as unknown[] };
+  }
   if (type.includes("vector")) return [];
   if (type.includes("string")) return "";
   if (type.includes("bool")) return false;
   if (type.includes("char")) return "\0";
   if (type.includes("int") || type.includes("double") || type.includes("float") || type.includes("long") || type.includes("short")) return 0;
   return uninitialized;
+}
+
+function classTypeName(type: string) {
+  return type.replace(/\*+$/, "").split("<", 1)[0]!.trim();
 }
 
 function currentScope(frame: Frame) {
@@ -717,11 +878,39 @@ function truthy(value: unknown) {
   return Boolean(value);
 }
 
-function format(value: unknown) {
+function format(value: unknown): string {
   if (value === undefined) return "undefined";
   if (value === null) return "nullptr";
   if (typeof value === "boolean") return value ? "1" : "0";
+  if (isStdContainer(value)) return `${value.__container}{${value.items.map(format).join(", ")}}`;
+  if (isStdMap(value)) return `${value.__container}{${value.entries.map((entry) => `${format(entry.key)}: ${format(entry.value)}`).join(", ")}}`;
   return String(value);
+}
+
+function isStdContainer(value: unknown): value is { __container: string; __order?: string; items: unknown[] } {
+  return Boolean(value && typeof value === "object" && typeof (value as { __container?: unknown }).__container === "string" && Array.isArray((value as { items?: unknown }).items));
+}
+
+function isStdMap(value: unknown): value is { __container: "map" | "unordered_map"; entries: Array<{ key: unknown; value: unknown }> } {
+  return Boolean(value && typeof value === "object" && ["map", "unordered_map"].includes(String((value as { __container?: unknown }).__container)) && Array.isArray((value as { entries?: unknown }).entries));
+}
+
+function isRuntimeIterator(value: unknown): value is RuntimeIterator {
+  return Boolean(value && typeof value === "object" && "__traceflowIterator" in value && Array.isArray((value as RuntimeIterator).array));
+}
+
+function mapValueType(type: string) {
+  const start = type.indexOf("<");
+  const end = type.lastIndexOf(">");
+  if (start < 0 || end <= start) return "";
+  const argumentsText = type.slice(start + 1, end);
+  let depth = 0;
+  for (let i = 0; i < argumentsText.length; i += 1) {
+    if (argumentsText[i] === "<") depth += 1;
+    else if (argumentsText[i] === ">") depth -= 1;
+    else if (argumentsText[i] === "," && depth === 0) return argumentsText.slice(i + 1).trim();
+  }
+  return "";
 }
 
 function convertInput(token: string, type: string) {
@@ -746,6 +935,8 @@ function clone<T>(value: T): T {
 }
 
 function nameOfValue(value: unknown) {
+  if (isStdMap(value)) return value.__container;
+  if (isStdContainer(value)) return value.__container;
   return Array.isArray(value) ? "vector" : "array";
 }
 

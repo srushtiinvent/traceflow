@@ -31,7 +31,14 @@ jobs:
         run: npm ci
 
       - name: Build
-        run: npm run build
+        env:
+          VITE_CPP_RUNNER_URL: ${{ vars.CPP_RUNNER_URL }}
+        run: |
+          if [ -z "$VITE_CPP_RUNNER_URL" ]; then
+            echo "Set the CPP_RUNNER_URL repository Actions variable to the deployed compiler service URL."
+            exit 1
+          fi
+          npm run build
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
