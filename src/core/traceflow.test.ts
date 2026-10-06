@@ -86,6 +86,88 @@ int main() {
   assert.equal(result.output.trim(), "1 2 2 6");
 });
 
+test("struct node pointers support construction, arrows, and list traversal", () => {
+  const source = `#include <iostream>
+using namespace std;
+struct Node {
+  int val;
+  Node* next;
+  Node(int x) : val(x), next(nullptr) {}
+};
+int main() {
+  Node* head = new Node(1);
+  head->next = new Node(2);
+  head->next->next = new Node(3);
+  Node* curr = head;
+  while (curr != NULL) {
+    cout << curr->val << " ";
+    curr = curr->next;
+  }
+  return 0;
+}`;
+  const result = runProgram(source, "");
+  assert.equal(result.error, undefined);
+  assert.equal(result.output, "1 2 3 ");
+});
+
+test("LinkedList methods can read and update implicit this fields", () => {
+  const source = `#include <iostream>
+using namespace std;
+struct Node {
+  int data;
+  Node* next;
+  Node(int val) : data(val), next(nullptr) {}
+};
+class LinkedList {
+private:
+  Node* head;
+public:
+  LinkedList() : head(nullptr) {}
+  void insert(int val) {
+    Node* newNode = new Node(val);
+    if (!head) { head = newNode; return; }
+    Node* temp = head;
+    while (temp->next) temp = temp->next;
+    temp->next = newNode;
+  }
+  void reverse() {
+    Node* prev = nullptr;
+    Node* current = head;
+    Node* next = nullptr;
+    while (current) {
+      next = current->next;
+      current->next = prev;
+      prev = current;
+      current = next;
+    }
+    head = prev;
+  }
+  void printList() {
+    Node* temp = head;
+    while (temp) {
+      cout << temp->data << (temp->next ? " " : "");
+      temp = temp->next;
+    }
+    cout << endl;
+  }
+};
+int main() {
+  int n, val;
+  cin >> n;
+  LinkedList list;
+  for (int i = 0; i < n; ++i) { cin >> val; list.insert(val); }
+  // Print before and after reversing the list.
+  list.printList();
+  list.reverse();
+  list.printList();
+  return 0;
+}`;
+  const result = runProgram(source, "5 10 20 30 40 50");
+  assert.equal(result.error, undefined);
+  assert.equal(result.output, "10 20 30 40 50\n50 40 30 20 10\n");
+  assert.deepEqual(result.unusedInput, []);
+});
+
 test("capturing lambdas and vector size constructors run with cin input", () => {
   const source = `#include <iostream>
 #include <vector>

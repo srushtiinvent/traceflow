@@ -73,7 +73,7 @@ function parseClass(node: Node, name: string): ClassAst {
   for (const member of body?.namedChildren ?? []) {
     if (member.type === "field_declaration") {
       const type = field(member, "type")?.text ?? "auto";
-      for (const part of member.namedChildren.filter((child) => ["field_declarator", "identifier", "init_declarator", "pointer_declarator"].includes(child.type))) {
+      for (const part of member.namedChildren.filter((child) => ["field_declarator", "field_identifier", "identifier", "init_declarator", "pointer_declarator"].includes(child.type))) {
         const decl = part.type === "field_declarator" ? part.namedChildren[0] ?? part : part;
         const variable = parseVariableDecl(decl, type);
         if (firstOfType(decl, "pointer_declarator")) variable.type = `${type}*`;
@@ -87,7 +87,7 @@ function parseClass(node: Node, name: string): ClassAst {
           const initList = member.namedChildren.find((part) => part.type === "field_initializer_list");
           for (const init of initList?.namedChildren ?? []) {
             const fieldName = field(init, "field")?.text ?? init.namedChildren[0]?.text;
-            const args = field(init, "arguments")?.namedChildren ?? [];
+            const args = field(init, "arguments")?.namedChildren ?? init.namedChildren.find((part) => part.type === "argument_list")?.namedChildren ?? [];
             if (fieldName) constructorInitializers[fieldName] = args.map(parseExpression);
           }
         }
@@ -135,6 +135,8 @@ function parseParameter(node: Node): Parameter {
 function parseStatement(node: Node): Stmt {
   const line = lineOf(node);
   switch (node.type) {
+    case "comment":
+      return { kind: "empty", line };
     case "compound_statement":
       return { kind: "block", body: node.namedChildren.map(parseStatement), line };
     case "declaration":
@@ -390,7 +392,7 @@ function parseExpression(node: Node): Expr {
         : { kind: "unsupported", label: "type casts", line };
     case "new_expression": {
       const type = field(node, "type")?.text ?? node.namedChildren.find((part) => part.type === "type_identifier")?.text ?? "";
-      const args = node.namedChildren.find((part) => part.type === "arguments")?.namedChildren.map(parseExpression) ?? [];
+      const args = (field(node, "arguments") ?? node.namedChildren.find((part) => part.type === "argument_list"))?.namedChildren.map(parseExpression) ?? [];
       return { kind: "call", callee: `new:${type}`, args, line };
     }
     case "delete_expression": {

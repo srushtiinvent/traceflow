@@ -63,6 +63,16 @@ export function runProgram(source: string, stdin: string): RunResult {
     }
     return undefined;
   };
+  const resolveThisProperty = (name: string) => {
+    for (let frameIndex = frames.length - 1; frameIndex >= 0; frameIndex -= 1) {
+      const frame = frames[frameIndex]!;
+      const instance = frame.vars.get("this");
+      if (instance && typeof instance === "object" && name in instance) {
+        return instance as Record<string, unknown>;
+      }
+    }
+    return undefined;
+  };
   const typeOfVariable = (name: string) => resolveVariable(name)?.types.get(name);
   const currentVariables = () => {
     const result: Record<string, unknown> = {};
@@ -262,11 +272,17 @@ export function runProgram(source: string, stdin: string): RunResult {
         if (expression.name === "cin") return inputStream;
         if (expression.name === "cout") return outputStream;
         if (expression.name === "endl") return endLine;
+        if (expression.name === "NULL") return null;
         if (expression.name === "true") return true;
         if (expression.name === "false") return false;
         const resolved = resolveVariable(expression.name);
         const frame = resolved?.frame;
-        if (!frame) return fault(`“${expression.name}” is not defined.`, expression.line);
+        if (!frame) {
+          const instance = resolveThisProperty(expression.name);
+          if (!instance) return fault(`“${expression.name}” is not defined.`, expression.line);
+          reads.add(expression.name);
+          return instance[expression.name];
+        }
         reads.add(expression.name);
         const value = resolved!.vars.get(expression.name);
         if (value === uninitialized) fault(`“${expression.name}” is used before it is initialized.`, expression.line);
@@ -411,7 +427,11 @@ export function runProgram(source: string, stdin: string): RunResult {
   const getLocation = (expression: Expr, line: number): Location => {
     if (expression.kind === "identifier") {
       const resolved = resolveVariable(expression.name);
-      if (!resolved) return fault(`“${expression.name}” is not defined.`, line);
+      if (!resolved) {
+        const instance = resolveThisProperty(expression.name);
+        if (instance) return { kind: "property", object: instance, name: expression.name };
+        return fault(`“${expression.name}” is not defined.`, line);
+      }
       return { kind: "variable", vars: resolved.vars, name: expression.name };
     }
     if (expression.kind === "member") {
