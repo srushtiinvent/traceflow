@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { prepareCppSource } from './prepare-source.mjs';
 
 const maxOutputBytes = 1024 * 1024;
 
@@ -44,11 +45,13 @@ function runProcess(command, args, { cwd, input = '', timeoutMs }) {
 }
 
 export async function runCppLocally(source, stdin) {
+  const prepared = prepareCppSource(source);
+  if (prepared.error) return { stdout: '', stderr: prepared.error, exitCode: 1 };
   const directory = await mkdtemp(path.join(tmpdir(), 'traceflow-local-cpp-'));
   try {
     const sourcePath = path.join(directory, 'main.cpp');
     const binaryPath = path.join(directory, 'program');
-    await writeFile(sourcePath, source);
+    await writeFile(sourcePath, prepared.source);
     const compiler = process.env.CXX || 'clang++';
     const compilation = await runProcess(compiler, ['-std=c++20', '-O0', '-pipe', sourcePath, '-o', binaryPath], { cwd: directory, timeoutMs: 20_000 });
     if (compilation.exitCode !== 0 || compilation.timedOut || compilation.outputTooLarge) {

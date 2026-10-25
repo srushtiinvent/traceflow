@@ -44,6 +44,7 @@ export function parseProgram(source: string): CppProgram {
     const functions: FunctionAst[] = [];
     const classes: ClassAst[] = [];
     const root = tree.rootNode;
+    const topLevelStatements: Stmt[] = [];
     for (const child of root.namedChildren) {
       if (child.type === "function_definition") functions.push(parseFunction(child));
       else if (child.type === "class_specifier" || child.type === "struct_specifier") {
@@ -55,13 +56,19 @@ export function parseProgram(source: string): CppProgram {
           const name = field(declaration, "name")?.text ?? declaration.namedChildren.find((part) => part.type === "type_identifier")?.text;
           if (name) classes.push(parseClass(declaration, name));
         }
+      } else if (["preproc_include", "preproc_def", "preproc_function_def", "using_declaration", "namespace_definition"].includes(child.type)) {
+        // These declarations remain available to the native compiler; they do not form trace steps.
       } else if (
         child.type === "declaration" &&
         child.namedChildren.some((part) => part.type === "init_declarator" || part.type === "identifier")
       ) {
-        // Global objects are intentionally not executed as top-level statements.
-        errors.push({ line: lineOf(child), message: "Global variables are not supported yet; declare values inside main()." });
+        topLevelStatements.push(parseStatement(child));
+      } else if (child.type !== "comment") {
+        topLevelStatements.push(parseStatement(child));
       }
+    }
+    if (!functions.some((fn) => fn.name === "main") && topLevelStatements.length) {
+      functions.push({ name: "main", returnType: "int", parameters: [], body: { kind: "block", body: topLevelStatements, line: topLevelStatements[0]?.line ?? 1 }, line: 1 });
     }
     return { functions, classes, errors: dedupeIssues(errors) };
   } finally {

@@ -43,7 +43,9 @@ export function runProgram(source: string, stdin: string): RunResult {
   let stepCount = 0;
   const functions = new Map(parsed.functions.map((fn) => [fn.name, fn]));
   const classes = new Map(parsed.classes.map((type) => [type.name, type]));
-  const main = functions.get("main");
+  // A standalone function can be traced directly. `main` remains the preferred
+  // entry point when present; otherwise run the first function definition.
+  const main = functions.get("main") ?? parsed.functions[0];
   const frames: Frame[] = [];
   const tokens = stdin.split(/\s+/).filter(Boolean);
   let inputIndex = 0;
@@ -754,8 +756,9 @@ export function runProgram(source: string, stdin: string): RunResult {
       const first = parsed.errors[0]!;
       throw new RuntimeFault(first.message, first.line);
     }
-    if (!main) throw new RuntimeFault("No main() function was found.", 1);
-    callFunction("main", [], main.line);
+    if (!main) throw new RuntimeFault("Add a function or a C++ statement to run.", 1);
+    if (main.parameters.length) throw new RuntimeFault(`The entry function ${main.name}() needs ${main.parameters.length} argument(s). Add a main() function to call it with values.`, main.line);
+    callFunction(main.name, [], main.line);
     if (returned !== undefined) {
       // The return value is exposed in the final snapshot for inspection.
       const final = snapshots.at(-1);

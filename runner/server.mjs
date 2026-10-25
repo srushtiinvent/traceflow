@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { prepareCppSource } from './prepare-source.mjs';
 
 const port = Number(process.env.PORT ?? 8787);
 const image = process.env.TRACEFLOW_CPP_IMAGE ?? 'traceflow-cpp-runner:latest';
@@ -117,10 +118,12 @@ const server = createServer(async (request, response) => {
     if (typeof body.source !== 'string' || typeof body.stdin !== 'string') return send(response, 400, { error: 'source and stdin must be strings.' }, origin);
     if (Buffer.byteLength(body.source) > maxSourceBytes) return send(response, 413, { error: 'Source is too large (128 KB maximum).' }, origin);
     if (Buffer.byteLength(body.stdin) > maxInputBytes) return send(response, 413, { error: 'Input is too large (16 KB maximum).' }, origin);
+    const prepared = prepareCppSource(body.source);
+    if (prepared.error) return send(response, 400, { error: prepared.error }, origin);
     await mkdir(sourceRoot, { recursive: true });
     sourceDirectory = await mkdtemp(path.join(sourceRoot, 'traceflow-cpp-'));
     await chmod(sourceDirectory, 0o755);
-    await writeFile(path.join(sourceDirectory, 'main.cpp'), body.source, { mode: 0o444 });
+    await writeFile(path.join(sourceDirectory, 'main.cpp'), prepared.source, { mode: 0o444 });
     const result = await runInSandbox(sourceDirectory, body.stdin);
     if (result.timedOut) result.stderr += '\nExecution was stopped after the compiler or program exceeded its time limit.';
     send(response, 200, result, origin);

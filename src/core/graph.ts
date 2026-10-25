@@ -18,7 +18,7 @@ export function buildProgramGraph(source: string): ProgramGraph {
   const lambdaFunctions = astFunctions.flatMap((fn) => collectLambdas(fn.body));
   const functions = [...astFunctions, ...lambdaFunctions].map((fn) => buildFunctionGraph(fn, source));
   if (functions.length === 0 && parsed.errors.length === 0) {
-    parsed.errors.push({ line: 1, message: "No function definition found. Add a main() function to run this program." });
+    parsed.errors.push({ line: 1, message: "No runnable C++ code found. Add a statement or function to run." });
   }
   return { functions, errors: parsed.errors };
 }
