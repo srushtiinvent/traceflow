@@ -15,10 +15,15 @@ export function prepareCppSource(source, entryName = '') {
   const functions = [...body.matchAll(functionPattern)];
 
   if (functions.length) {
-    const entry = functions.find((candidate) => candidate[2] === entryName) ?? functions[0];
+    const solutionEntry = functions.find((candidate) => {
+      const methodOffset = (candidate.index ?? 0) + candidate[0].indexOf(candidate[2]);
+      return findOwnerClass(body, methodOffset) === 'Solution';
+    });
+    const entry = functions.find((candidate) => candidate[2] === entryName) ?? solutionEntry ?? functions[0];
     const name = entry[2];
     const parameters = splitParameters(entry[3].trim());
-    const className = body.match(/\bclass\s+(\w+)/)?.[1] ?? body.match(/\bstruct\s+(\w+)/)?.[1];
+    const methodOffset = (entry.index ?? 0) + entry[0].indexOf(name);
+    const className = findOwnerClass(body, methodOffset);
     const args = [];
     const reads = [];
     for (let index = 0; index < parameters.length; index += 1) {
@@ -44,13 +49,42 @@ export function prepareCppSource(source, entryName = '') {
     const invocation = `${receiver}(${args.join(', ')})`;
     const result = returnType === 'void' ? `${invocation};` : `auto traceflow_result = ${invocation}; std::cout << traceflow_result << '\\n';`;
     const setup = `${className ? `${className} traceflow_entry{}; ` : ''}${reads.join(' ')} ${result}`;
-    const supportIncludes = ['#include <iostream>', '#include <vector>', '#include <cstddef>'].filter((required) =>
-      !includes.some((line) => line.includes(required.slice(required.indexOf('<')))));
+    // Judge-style submissions often omit headers and `using namespace std`.
+    // Supply the common standard-library headers used by snippets, while
+    // keeping any headers provided by the user intact.
+    const supportIncludes = [
+      '#include <iostream>', '#include <vector>', '#include <cstddef>',
+      '#include <unordered_map>', '#include <map>', '#include <set>',
+      '#include <unordered_set>', '#include <queue>', '#include <stack>',
+      '#include <deque>', '#include <algorithm>', '#include <utility>',
+      '#include <string>', '#include <array>', '#include <numeric>',
+      '#include <cmath>', '#include <limits>',
+    ].filter((required) => !includes.some((line) => line.includes(required.slice(required.indexOf('<')))));
+    const namespaceDirective = includes.some((line) => /^\s*using\s+namespace\s+std\s*;/.test(line))
+      ? ''
+      : 'using namespace std;';
     const vectorReader = `template <typename T> bool traceflow_read_input(std::istream& input, std::vector<T>& values);\ntemplate <typename T> bool traceflow_read_input(std::istream& input, T& value) { return static_cast<bool>(input >> value); }\ntemplate <typename T> bool traceflow_read_input(std::istream& input, std::vector<T>& values) { char ch; if (!(input >> ch) || ch != '[') return false; while (input >> std::ws && input.peek() != ']') { T value{}; if (!traceflow_read_input(input, value)) return false; values.push_back(std::move(value)); input >> std::ws; if (input.peek() == ',') input.get(); else if (input.peek() != ']') return false; } input.get(); return true; }`;
-    return { source: `${supportIncludes.join('\n')}\n${includes.join('\n')}\n${vectorReader}\n${body}\n\nint main() { ${setup} return 0; }`, error: '' };
+    return { source: `${supportIncludes.join('\n')}\n${includes.join('\n')}\n${namespaceDirective}\n${vectorReader}\n${body}\n\nint main() { ${setup} return 0; }`, error: '' };
   }
 
   return { source: `${includes.join('\n')}\nint main() {\n${body}\n  return 0;\n}\n`, error: '' };
+}
+
+function findOwnerClass(source, methodOffset) {
+  const declarations = [...source.matchAll(/\b(class|struct)\s+([A-Za-z_]\w*)[^;{]*\{/g)];
+  const containing = declarations
+    .map((match) => {
+      const open = (match.index ?? 0) + match[0].lastIndexOf('{');
+      let depth = 1;
+      for (let index = open + 1; index < source.length; index += 1) {
+        if (source[index] === '{') depth += 1;
+        else if (source[index] === '}' && --depth === 0) return { name: match[2], open, close: index };
+      }
+      return undefined;
+    })
+    .filter((declaration) => declaration && declaration.open < methodOffset && methodOffset < declaration.close)
+    .sort((left, right) => right.open - left.open);
+  return containing[0]?.name;
 }
 
 function splitParameters(text) {

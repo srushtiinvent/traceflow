@@ -11,9 +11,13 @@ import type {
 
 export function buildProgramGraph(source: string): ProgramGraph {
   const parsed = parseProgram(source);
+  const classMethods = parsed.classes.flatMap((type) => type.methods);
+  const solutionMethods = classMethods.filter((method) => parsed.classes.some((type) => type.name === "Solution" && type.methods.includes(method)));
+  const otherClassMethods = classMethods.filter((method) => !solutionMethods.includes(method));
   const astFunctions = [
     ...parsed.functions,
-    ...parsed.classes.flatMap((type) => type.methods),
+    ...solutionMethods,
+    ...otherClassMethods,
   ];
   const lambdaFunctions = astFunctions.flatMap((fn) => collectLambdas(fn.body));
   const functions = [...astFunctions, ...lambdaFunctions].map((fn) => buildFunctionGraph(fn, source));

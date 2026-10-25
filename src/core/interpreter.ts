@@ -50,7 +50,10 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
     .map((method) => ({ type, method })));
   const selectedClassEntry = entryName ? allClassEntries.find((entry) => entry.method.name === entryName) : undefined;
   const selectedFunction = entryName ? parsed.functions.find((fn) => fn.name === entryName) : undefined;
-  const main = functions.get("main") ?? selectedFunction ?? selectedClassEntry?.method ?? parsed.functions[0] ?? allClassEntries[0]?.method;
+  const solutionEntry = parsed.classes
+    .find((type) => type.name === "Solution")
+    ?.methods.find((method) => method.name !== "Solution");
+  const main = functions.get("main") ?? selectedFunction ?? selectedClassEntry?.method ?? parsed.functions[0] ?? solutionEntry ?? allClassEntries[0]?.method;
   const activeClassEntry = allClassEntries.find((entry) => entry.method === main);
   const frames: Frame[] = [];
   const tokens = stdin.split(/\s+/).filter(Boolean);
@@ -170,7 +173,9 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
               const size = toNumber(initial[0]);
               if (!Number.isInteger(size) || size < 0 || size > 100_000) return fault("Vector size must be a non-negative integer no greater than 100,000.", declaration.line);
               value = Array.from({ length: size }, () => clone(initial.length > 1 ? initial[1] : defaultValue(arrayElementType(declaration.type))));
-            } else value = Array.isArray(initial) ? clone(initial) : initial;
+            } else value = Array.isArray(initial)
+              ? initial.map((item) => coerceValue(item, arrayElementType(declaration.type)))
+              : coerceValue(initial, declaration.type);
             }
           }
           scope.vars.set(declaration.name, value);
@@ -255,7 +260,7 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
         const iterable = isStdContainer(values) ? values.items : isStdMap(values) ? values.entries.map((entry) => ({ first: entry.key, second: entry.value })) : values as Iterable<unknown>;
         let rangeIndex = 0;
         for (const value of iterable) {
-          rangeScope.vars.set(statement.variable.name, value);
+          rangeScope.vars.set(statement.variable.name, coerceValue(value, statement.variable.type));
           changes.add(statement.variable.name);
           record(statement.line);
           try {
@@ -545,7 +550,7 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
   };
   const writeLocation = (location: Location, value: unknown) => {
     if (location.kind === "variable") {
-      location.vars.set(location.name, value);
+      location.vars.set(location.name, coerceValue(value, variableType(location)));
       changes.add(location.name);
     } else if (location.kind === "property") {
       location.object[location.name] = value;
@@ -572,7 +577,7 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
     }
     const frame: Frame = { fn, vars: new Map(), types: new Map(), scopes: [] };
     fn.parameters.forEach((parameter, index) => {
-      frame.vars.set(parameter.name, args[index]);
+      frame.vars.set(parameter.name, coerceValue(args[index], parameter.type));
       frame.types.set(parameter.name, parameter.type);
     });
     frames.push(frame);
@@ -595,7 +600,7 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
     const fn = lambda.fn;
     if (args.length !== fn.parameters.length) return fault(`Lambda expects ${fn.parameters.length} arguments, but received ${args.length}.`, line);
     const frame: Frame = { fn, vars: new Map(), types: new Map(), scopes: [] };
-    fn.parameters.forEach((parameter, index) => { frame.vars.set(parameter.name, args[index]); frame.types.set(parameter.name, parameter.type); });
+    fn.parameters.forEach((parameter, index) => { frame.vars.set(parameter.name, coerceValue(args[index], parameter.type)); frame.types.set(parameter.name, parameter.type); });
     frames.push(frame); record(fn.line);
     try { execute(fn.body); return undefined; }
     catch (signal) { if (signal instanceof FlowSignal && signal.type === "return") return signal.value; throw signal; }
@@ -698,6 +703,17 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
       if (Array.isArray(receiver) || typeof receiver === "string") return receiver.length === 0;
       fault("empty() requires a vector, array, or string.", line);
     }
+    if (method === "assign") {
+      if (!Array.isArray(receiver)) return fault("assign() requires a vector.", line);
+      if (args.length !== 2 || typeof args[0] !== "number") {
+        return fault("Vector assign() currently expects a count and fill value, such as assign(5, 0).", line);
+      }
+      const count = Math.max(0, Math.trunc(args[0]));
+      if (count > 100_000) return fault("Vector assign() is limited to 100,000 elements in the visualiser.", line);
+      receiver.splice(0, receiver.length, ...Array(count).fill(clone(args[1])));
+      changes.add(nameOfValue(receiver));
+      return undefined;
+    }
     if (method === "back") {
       if (Array.isArray(receiver) && receiver.length > 0) return receiver.at(-1);
       fault("back() cannot be used on an empty vector.", line);
@@ -738,7 +754,7 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
   const executeMethod = (fn: FunctionAst, self: unknown, args: unknown[], line: number) => {
     if (args.length !== fn.parameters.length) return fault(`${fn.name} expects ${fn.parameters.length} argument(s), but received ${args.length}.`, line);
     const frame: Frame = { fn, vars: new Map([["this", self]]), types: new Map([["this", "object"]]), scopes: [] };
-    fn.parameters.forEach((parameter, index) => { frame.vars.set(parameter.name, args[index]); frame.types.set(parameter.name, parameter.type); });
+    fn.parameters.forEach((parameter, index) => { frame.vars.set(parameter.name, coerceValue(args[index], parameter.type)); frame.types.set(parameter.name, parameter.type); });
     frames.push(frame); record(fn.line);
     try {
       if (self && typeof self === "object") {
@@ -1005,7 +1021,18 @@ function convertInput(token: string, type: string) {
   if (type.includes("bool")) return token === "true" || token === "1";
   const number = Number(token);
   if (Number.isNaN(number)) return token;
-  return number;
+  return coerceValue(number, type);
+}
+
+function coerceValue(value: unknown, type: string): unknown {
+  const normalized = type.replace(/\bconst\b|[&*]/g, "").trim();
+  if (normalized.includes("<")) return value;
+  if (/\bbool\b/.test(normalized)) return truthy(value);
+  if (/\b(?:float|double)\b/.test(normalized)) return toNumber(value);
+  if (/\b(?:short|int|long|size_t|ptrdiff_t|u?int\d+_t)\b/.test(normalized)) {
+    return Math.trunc(toNumber(value));
+  }
+  return value;
 }
 
 function clone<T>(value: T): T {
