@@ -258,8 +258,8 @@ function App() {
     if (activeLine) editorRef.current.revealLineInCenterIfOutsideViewport(activeLine);
   }, [activeLine, errors]);
 
-  const execute = useCallback((code: string, input: string) => {
-    try { return runProgram(code, input); }
+  const execute = useCallback((code: string, input: string, entryName?: string) => {
+    try { return runProgram(code, input, entryName); }
     catch (error) {
       notify(error instanceof Error ? error.message : String(error));
       return null;
@@ -267,7 +267,7 @@ function App() {
   }, [notify]);
 
   const runCurrent = useCallback(() => {
-    const result = execute(sourceRef.current, stdin);
+    const result = execute(sourceRef.current, stdin, functionName);
     if (!result) return;
     const firstAlgorithmStep = result.snapshots.findIndex((snapshot) => {
       const name = snapshot.nodeId.split(':')[0];
@@ -281,14 +281,14 @@ function App() {
     setNativeRun(null);
     setCompareRun(null);
     setFunctionName(initialFunction);
-    // Keep one function's chart visible throughout playback. The active step
-    // can enter helper functions without replacing the user's current chart.
-    setFollowTraceFunction(false);
+    // Follow calls across functions so helper methods get their own chart
+    // while they execute and runtime errors are shown on the failing stage.
+    setFollowTraceFunction(true);
     setActiveIndex(firstAlgorithmStep >= 0 ? firstAlgorithmStep : 0);
     setIsPlaying(false);
     setMobileView('visualise');
     notify(`${result.snapshots.length} steps ready`);
-  }, [execute, graph, notify, stdin]);
+  }, [execute, functionName, graph, notify, stdin]);
 
   const compileAndRun = useCallback(async () => {
     setNativeRunning(true);
@@ -302,7 +302,7 @@ function App() {
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ source: sourceRef.current, stdin }),
+        body: JSON.stringify({ source: sourceRef.current, stdin, entryName: functionName }),
       });
       const responseText = await response.text();
       let payload: any;
@@ -324,7 +324,7 @@ function App() {
     } finally {
       setNativeRunning(false);
     }
-  }, [stdin, notify]);
+  }, [functionName, stdin, notify]);
 
   const step = (direction: number) => {
     setIsPlaying(false);
@@ -460,6 +460,7 @@ function App() {
             <button className="quiet-button" onClick={() => { setCompareOpen((current) => !current); if (!compareSource) setCompareSource(source); }} data-testid="button-compare"><Layers3 size={14} /><span>Compare</span></button>
             <button className="quiet-button" onClick={shareCode} data-testid="button-share"><Copy size={14} /><span>Share</span></button>
             <button className="quiet-button" onClick={exportPng} data-testid="button-export"><ArrowDownToLine size={14} /><span>PNG</span></button>
+            <button className="quiet-button" onClick={compileAndRun} disabled={nativeRunning} title="Compile and run the complete C++ program" aria-label="Compile and run" data-testid="button-compile-run"><Terminal size={14} /><span>{nativeRunning ? 'Compiling…' : 'Compile & run'}</span></button>
             <button className="primary-button" onClick={runCurrent} data-testid="button-run"><Play size={13} fill="currentColor" /> Visualise</button>
           </div>
         </div>
@@ -539,7 +540,7 @@ function App() {
       {sheetOpen ? <><button className="sheet-scrim" aria-label="Close inspector" onClick={() => setSheetOpen(false)} data-testid="button-close-inspector-scrim" /><Inspector activeSnapshot={activeSnapshot} values={values} prev={prevValues} arrays={arrayVariables} frames={frameList} result={run} nativeRun={nativeRun} selected={inspectorTab} onSelect={setInspectorTab} sheet onClose={() => setSheetOpen(false)} /></> : null}
 
       {showExamples ? <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowExamples(false); }}><div className="modal"><div className="modal-head"><h2>Start with an example</h2><button className="icon-button" aria-label="Close examples" onClick={() => setShowExamples(false)} data-testid="button-close-examples"><X size={15} /></button></div>{EXAMPLES.map((example) => <button key={example.name} className="example-item" onClick={() => loadExample(example)} data-testid={`button-example-${example.name.toLowerCase().replaceAll(' ', '-')}`}><span><b>{example.name}</b><small>{example.description}</small></span><ChevronDown size={14} /></button>)}</div></div> : null}
-      {stdinOpen ? <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setStdinOpen(false); }}><div className="modal"><div className="modal-head"><h2>Program input</h2><button className="icon-button" aria-label="Close input" onClick={() => setStdinOpen(false)} data-testid="button-close-stdin"><X size={15} /></button></div><p className="modal-hint">Lines here are passed to the program as standard input.</p><textarea aria-label="Standard input" value={stdin} onChange={(event) => setStdin(event.target.value)} placeholder="Enter input, one line at a time…" data-testid="input-stdin" /><div className="modal-actions"><button className="quiet-button" onClick={() => setStdin('')} data-testid="button-clear-stdin">Clear</button><button className="primary-button" onClick={() => setStdinOpen(false)} data-testid="button-save-stdin"><Check size={13} /> Done</button></div></div></div> : null}
+      {stdinOpen ? <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setStdinOpen(false); }}><div className="modal"><div className="modal-head"><h2>Program input</h2><button className="icon-button" aria-label="Close input" onClick={() => setStdinOpen(false)} data-testid="button-close-stdin"><X size={15} /></button></div><p className="modal-hint">Lines are standard input. Without main(), values are also passed to the selected function’s parameters in order. Enter vector data as brackets, such as [[1,0],[0,1]], or use a length followed by values for a one-dimensional vector.</p><textarea aria-label="Standard input" value={stdin} onChange={(event) => setStdin(event.target.value)} placeholder="Enter input, one line at a time…" data-testid="input-stdin" /><div className="modal-actions"><button className="quiet-button" onClick={() => setStdin('')} data-testid="button-clear-stdin">Clear</button><button className="primary-button" onClick={() => setStdinOpen(false)} data-testid="button-save-stdin"><Check size={13} /> Done</button></div></div></div> : null}
       {toast ? <div className="toast-note" role="status" data-testid="status-toast">{toast}</div> : null}
     </div>
   );

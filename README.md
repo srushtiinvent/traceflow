@@ -5,7 +5,7 @@ TraceFlow has two execution paths:
 - **Visualise** uses the in-browser interpreter and records snapshots for the flowchart. It supports a growing C++ subset, not the complete language.
 - **Compile & run** submits the source and standard input to the optional hosted compiler runner. It uses GCC C++20 and shows real stdout, compiler diagnostics, and exit status. This mode does not create variable-by-variable flowchart snapshots.
 
-Both paths can run a short C++ snippet without `main()`: TraceFlow treats top-level statements as an implicit `main()`, or starts the first parameterless function. If a function needs arguments, add a `main()` that calls it with the values you want to try. Full programs with their own `main()` run as written.
+Both paths can run C++ without `main()`: TraceFlow treats top-level statements as an implicit `main()`, or starts the first free function (or first method in a class) and reads its arguments from the Input panel, in declaration order. Use the function selector above the flowchart to choose a different entry function. Vector arguments accept bracketed arrays such as `[[1,0],[0,1]]`; one-dimensional vectors also accept a length followed by values. A returned value appears as program output. Full programs with their own `main()` run as written.
 
 The local development server includes a compiler endpoint, so **Compile & run works on localhost** without a separate service. It requires `clang++` on your machine. Local programs run with your user account's permissions: only run code you trust.
 

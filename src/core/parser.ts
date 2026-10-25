@@ -289,12 +289,26 @@ function parseVariableDecl(node: Node, type: string): VariableDecl {
     type,
     initializer: initializer
       ? initializer.type === "parameter_list"
-        ? { kind: "list", values: initializer.namedChildren.map((argument) => parseExpression(argument.namedChildren[0] ?? argument)), form: "arguments", line: lineOf(initializer) }
+        ? { kind: "list", values: initializer.namedChildren.map(parseInitializerArgument), form: "arguments", line: lineOf(initializer) }
         : parseExpression(initializer)
       : undefined,
     arraySize: arraySizeNode ? parseExpression(arraySizeNode) : undefined,
     line: lineOf(node),
   };
+}
+
+function parseInitializerArgument(argument: Node): Expr {
+  const parameter = argument.type === "parameter_declaration"
+    ? argument
+    : argument.namedChildren.find((child) => child.type === "parameter_declaration");
+  const type = parameter ? field(parameter, "type") : undefined;
+  const declarator = parameter ? field(parameter, "declarator") : undefined;
+  if (type?.type === "template_type" && declarator && ["function_declarator", "abstract_function_declarator"].includes(declarator.type)) {
+    const name = type.text.slice(0, type.text.indexOf("<")).trim();
+    const args = field(declarator, "parameters")?.namedChildren.map((child) => parseExpression(child.namedChildren[0] ?? child)) ?? [];
+    return { kind: "call", callee: name, args, line: lineOf(argument) };
+  }
+  return parseExpression(argument.namedChildren[0] ?? argument);
 }
 
 function parseExpression(node: Node): Expr {
@@ -393,7 +407,10 @@ function parseExpression(node: Node): Expr {
       return { kind: "lambda", parameters, body: body ? parseStatement(body) : { kind: "empty", line }, line };
     }
     case "template_function":
-      return { kind: "identifier", name: node.namedChildren[0]?.text ?? node.text.split("<")[0] ?? "", line };
+    case "template_type": {
+      const templateName = node.text.slice(0, node.text.indexOf("<")).trim();
+      return { kind: "identifier", name: templateName || node.namedChildren[0]?.text || node.text, line };
+    }
     case "subscript_expression": {
       const object = field(node, "argument");
       const index = field(node, "indices")?.namedChildren[0];

@@ -168,6 +168,39 @@ int main() {
   assert.deepEqual(result.unusedInput, []);
 });
 
+test("a no-main class can run a selected second method with scalar input", () => {
+  const source = `class Solution {
+public:
+  int first(int n) { return n + 1; }
+  int second(int n) { return n * 10; }
+};`;
+  const result = runProgram(source, "7", "second");
+  assert.equal(result.error, undefined);
+  assert.equal(result.output.trim(), "70");
+  assert.equal(result.variables.$return, 70);
+});
+
+test("a no-main class method accepts nested vector input in Visualise", () => {
+  const source = `class Solution {
+public:
+  int closedIsland(vector<vector<int>>& grid) {
+    int rows = grid.size();
+    int cols = grid[0].size();
+    int closed = 0;
+    for (int r = 0; r < rows; r++) {
+      for (int c = 0; c < cols; c++) {
+        if (grid[r][c] == 0 && r > 0 && c > 0 && r < rows - 1 && c < cols - 1) closed++;
+      }
+    }
+    return closed;
+  }
+};`;
+  const input = "[[1,1,1,1,1,1,1,0],[1,0,0,0,0,1,1,0],[1,0,1,0,1,1,1,0],[1,0,0,0,0,1,0,1],[1,1,1,1,1,1,1,0]]";
+  const result = runProgram(source, input, "closedIsland");
+  assert.equal(result.error, undefined);
+  assert.equal(result.output.trim(), "11");
+});
+
 test("std::queue supports push, front, pop, size, and empty", () => {
   const source = `#include <iostream>
 #include <queue>
@@ -365,4 +398,28 @@ test("a runaway loop stops at the 5,000-step safety limit", () => {
   const result = runProgram("int main() { while (true) { int value = 1; } }", "");
   assert.match(result.error?.message ?? "", /possible infinite loop/i);
   assert.equal(result.snapshots.length, 5_000);
+});
+
+test("no-main closedIsland traces nested vectors and pair queues correctly", () => {
+  const source = `#include <queue>
+using namespace std;
+class Solution {
+public:
+ int closedIsland(vector<vector<int>>& grid) {
+  int m=grid.size(); int n=grid[0].size(); vector<vector<bool>> visit(m,vector<bool>(n)); int count=0;
+  for(int i=0;i<m;i++) for(int j=0;j<n;j++) if(grid[i][j]==0&&!visit[i][j]&&bfs(i,j,m,n,grid,visit)) count++;
+  return count;
+ }
+ bool bfs(int x,int y,int m,int n,vector<vector<int>>& grid,vector<vector<bool>>& visit) {
+  queue<pair<int,int>> q; q.push({x,y}); visit[x][y]=true; bool closed=true; int dx[4]={1,-1,0,0}; int dy[4]={0,0,1,-1};
+  while(!q.empty()) { auto p=q.front(); q.pop(); int i=p.first; int j=p.second; if(i==0||j==0||i==m-1||j==n-1) closed=false;
+   for(int k=0;k<4;k++) { int nx=i+dx[k], ny=j+dy[k]; if(nx>=0&&nx<m&&ny>=0&&ny<n&&grid[nx][ny]==0&&!visit[nx][ny]) { visit[nx][ny]=true; q.push({nx,ny}); } }
+  }
+  return closed;
+ }
+};`;
+  const input = "[[1,1,1,1,1,1,1,0],[1,0,0,0,0,1,1,0],[1,0,1,0,1,1,1,0],[1,0,0,0,0,1,0,1],[1,1,1,1,1,1,1,0]]";
+  const result = runProgram(source, input, "closedIsland");
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(result.output.trim(), "2");
 });

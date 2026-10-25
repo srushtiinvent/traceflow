@@ -118,7 +118,7 @@ const server = createServer(async (request, response) => {
     if (typeof body.source !== 'string' || typeof body.stdin !== 'string') return send(response, 400, { error: 'source and stdin must be strings.' }, origin);
     if (Buffer.byteLength(body.source) > maxSourceBytes) return send(response, 413, { error: 'Source is too large (128 KB maximum).' }, origin);
     if (Buffer.byteLength(body.stdin) > maxInputBytes) return send(response, 413, { error: 'Input is too large (16 KB maximum).' }, origin);
-    const prepared = prepareCppSource(body.source);
+    const prepared = prepareCppSource(body.source, typeof body.entryName === 'string' ? body.entryName : '');
     if (prepared.error) return send(response, 400, { error: prepared.error }, origin);
     await mkdir(sourceRoot, { recursive: true });
     sourceDirectory = await mkdtemp(path.join(sourceRoot, 'traceflow-cpp-'));

@@ -44,8 +44,8 @@ function runProcess(command, args, { cwd, input = '', timeoutMs }) {
   });
 }
 
-export async function runCppLocally(source, stdin) {
-  const prepared = prepareCppSource(source);
+export async function runCppLocally(source, stdin, entryName = '') {
+  const prepared = prepareCppSource(source, entryName);
   if (prepared.error) return { stdout: '', stderr: prepared.error, exitCode: 1 };
   const directory = await mkdtemp(path.join(tmpdir(), 'traceflow-local-cpp-'));
   try {

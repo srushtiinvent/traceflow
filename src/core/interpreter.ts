@@ -35,7 +35,7 @@ class FlowSignal {
   constructor(readonly type: "return" | "break" | "continue", readonly value?: unknown) {}
 }
 
-export function runProgram(source: string, stdin: string): RunResult {
+export function runProgram(source: string, stdin: string, entryName?: string): RunResult {
   const parsed = parseProgram(source);
   const snapshots: TraceSnapshot[] = [];
   const output: string[] = [];
@@ -45,9 +45,16 @@ export function runProgram(source: string, stdin: string): RunResult {
   const classes = new Map(parsed.classes.map((type) => [type.name, type]));
   // A standalone function can be traced directly. `main` remains the preferred
   // entry point when present; otherwise run the first function definition.
-  const main = functions.get("main") ?? parsed.functions[0];
+  const allClassEntries = parsed.classes.flatMap((type) => type.methods
+    .filter((method) => method.name !== type.name)
+    .map((method) => ({ type, method })));
+  const selectedClassEntry = entryName ? allClassEntries.find((entry) => entry.method.name === entryName) : undefined;
+  const selectedFunction = entryName ? parsed.functions.find((fn) => fn.name === entryName) : undefined;
+  const main = functions.get("main") ?? selectedFunction ?? selectedClassEntry?.method ?? parsed.functions[0] ?? allClassEntries[0]?.method;
+  const activeClassEntry = allClassEntries.find((entry) => entry.method === main);
   const frames: Frame[] = [];
   const tokens = stdin.split(/\s+/).filter(Boolean);
+  const tokenPositions = [...stdin.matchAll(/\S+/g)].map((match) => match.index ?? 0);
   let inputIndex = 0;
   let returned: unknown;
   const reads = new Set<string>();
@@ -634,7 +641,10 @@ export function runProgram(source: string, stdin: string): RunResult {
       if (method === "empty") return items.length === 0;
       if (method === "push" || method === "push_back" || method === "push_front") {
         if (args.length !== 1) return fault(`${label}.${method}() expects one value.`, line);
-        const value = args[0];
+        let value = args[0];
+        if (/^(?:std::)?pair\s*</.test(receiver.__valueType ?? "") && Array.isArray(value) && value.length >= 2) {
+          value = { first: value[0], second: value[1] };
+        }
         if (kind === "set" || kind === "unordered_set") {
           if (!items.some((item) => item === value)) items.push(value);
         } else if (kind === "priority_queue") {
@@ -757,12 +767,42 @@ export function runProgram(source: string, stdin: string): RunResult {
       throw new RuntimeFault(first.message, first.line);
     }
     if (!main) throw new RuntimeFault("Add a function or a C++ statement to run.", 1);
-    if (main.parameters.length) throw new RuntimeFault(`The entry function ${main.name}() needs ${main.parameters.length} argument(s). Add a main() function to call it with values.`, main.line);
-    callFunction(main.name, [], main.line);
+    const args = main.parameters.map((parameter) => {
+      if (parameter.type.includes("vector") || parameter.type.includes("array")) {
+        const structuredStart = tokenPositions[inputIndex];
+        if (structuredStart !== undefined && stdin.slice(structuredStart).trimStart().startsWith("[")) {
+          const parsed = readStructuredArray(stdin, structuredStart);
+          if (parsed) {
+            inputIndex = tokenPositions.findIndex((position) => position >= parsed.end);
+            if (inputIndex < 0) inputIndex = tokens.length;
+            return convertStructuredInput(parsed.value, parameter.type, main.line);
+          }
+        }
+        const countToken = tokens[inputIndex++];
+        if (countToken === undefined) throw new RuntimeFault(`Add a length and values for parameter ${parameter.name} in the Input panel.`, main.line);
+        const count = Number(countToken);
+        if (!Number.isInteger(count) || count < 0 || count > 100_000) throw new RuntimeFault(`The input length for ${parameter.name} must be between 0 and 100000.`, main.line);
+        const elementType = parameter.type.match(/<\s*([^,>]+)/)?.[1] ?? "int";
+        return Array.from({ length: count }, () => {
+          const token = tokens[inputIndex++];
+          if (token === undefined) throw new RuntimeFault(`Add all ${count} values for parameter ${parameter.name} in the Input panel.`, main.line);
+          return convertInput(token, elementType);
+        });
+      }
+      const token = tokens[inputIndex++];
+      if (token === undefined) throw new RuntimeFault(`Add a value for parameter ${parameter.name} in the Input panel.`, main.line);
+      return convertInput(token, parameter.type);
+    });
+    if (activeClassEntry) {
+      returned = executeMethod(main, makeObject(activeClassEntry.type.name), args, main.line);
+    } else {
+      callFunction(main.name, args, main.line);
+    }
     if (returned !== undefined) {
       // The return value is exposed in the final snapshot for inspection.
       const final = snapshots.at(-1);
       if (final) final.variables["$return"] = clone(returned);
+      if (!output.length) output.push(format(returned));
     }
   } catch (caught) {
     if (caught instanceof RuntimeFault) {
@@ -834,12 +874,55 @@ export function runProgram(source: string, stdin: string): RunResult {
   }
 }
 
+function readStructuredArray(source: string, start: number): { value: unknown; end: number } | undefined {
+  const opening = source.indexOf("[", start);
+  if (opening < 0) return undefined;
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = opening; index < source.length; index += 1) {
+    const char = source[index]!;
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quoted = false;
+      continue;
+    }
+    if (char === '"') quoted = true;
+    else if (char === "[") depth += 1;
+    else if (char === "]" && --depth === 0) {
+      try { return { value: JSON.parse(source.slice(opening, index + 1)), end: index + 1 }; }
+      catch { return undefined; }
+    }
+  }
+  return undefined;
+}
+
+function convertStructuredInput(value: unknown, type: string, line: number): unknown {
+  const normalized = type.replace(/\bconst\b|[&*]/g, "").trim();
+  const vector = normalized.match(/^(?:std::)?vector\s*<([\s\S]+)>$/);
+  if (vector) {
+    if (!Array.isArray(value)) throw new RuntimeFault("Vector input must be a bracketed array, such as [[1,0],[0,1]].", line);
+    return value.map((item) => convertStructuredInput(item, vector[1]!, line));
+  }
+  if (Array.isArray(value)) throw new RuntimeFault(`Input for ${normalized} must be a single value, not an array.`, line);
+  return convertInput(String(value), normalized);
+}
+
 function defaultValue(type: string): unknown {
   if (type.trimEnd().endsWith("*")) return null;
   if (type.includes("unordered_map")) return { __container: "unordered_map", entries: [] as Array<{ key: unknown; value: unknown }> };
   if (type.includes("map")) return { __container: "map", entries: [] as Array<{ key: unknown; value: unknown }> };
   for (const container of ["priority_queue", "unordered_set", "queue", "stack", "deque", "set"]) {
-    if (type.includes(container)) return { __container: container, __order: container === "priority_queue" && type.includes("greater") ? "min" : "max", items: [] as unknown[] };
+    if (type.includes(container)) {
+      const argumentsText = type.slice(type.indexOf("<") + 1, type.lastIndexOf(">"));
+      return {
+        __container: container,
+        __order: container === "priority_queue" && type.includes("greater") ? "min" : "max",
+        __valueType: argumentsText,
+        items: [] as unknown[],
+      };
+    }
   }
   if (type.includes("vector")) return [];
   if (type.includes("string")) return "";
@@ -890,7 +973,7 @@ function format(value: unknown): string {
   return String(value);
 }
 
-function isStdContainer(value: unknown): value is { __container: string; __order?: string; items: unknown[] } {
+function isStdContainer(value: unknown): value is { __container: string; __order?: string; __valueType?: string; items: unknown[] } {
   return Boolean(value && typeof value === "object" && typeof (value as { __container?: unknown }).__container === "string" && Array.isArray((value as { items?: unknown }).items));
 }
 

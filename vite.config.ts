@@ -32,7 +32,7 @@ const localCompiler: Plugin = {
         if (typeof body.source !== 'string' || typeof body.stdin !== 'string') throw Object.assign(new Error('source and stdin must be strings.'), { status: 400 });
         if (Buffer.byteLength(body.source) > 128 * 1024) throw Object.assign(new Error('Source is too large (128 KB maximum).'), { status: 413 });
         if (Buffer.byteLength(body.stdin) > 16 * 1024) throw Object.assign(new Error('Input is too large (16 KB maximum).'), { status: 413 });
-        const result = await runCppLocally(body.source, body.stdin);
+        const result = await runCppLocally(body.source, body.stdin, typeof body.entryName === 'string' ? body.entryName : '');
         response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
         response.end(JSON.stringify(result));
       } catch (error) {
