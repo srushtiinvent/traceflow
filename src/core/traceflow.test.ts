@@ -1,3 +1,5 @@
+/// <reference types="node" />
+
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -422,4 +424,56 @@ public:
   const result = runProgram(source, input, "closedIsland");
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.output.trim(), "2");
+});
+
+test("std::array supports fixed size, value-init, fill() and copy-on-assign", () => {
+  const source = `int main() {
+  array<bool, 8> flags{};
+  vector<array<bool, 8>> rows(2);
+  flags[3] = true;
+  rows[0] = flags;
+  flags.fill(false);
+  flags[5] = true;
+  int firstRow = 0;
+  for (int k = 0; k < 8; k++) if (rows[0][k]) firstRow = k;
+  return firstRow * 10 + (rows[1][3] ? 1 : 0) + (flags[3] ? 100 : 0);
+}`;
+  const result = runProgram(source, "");
+  assert.equal(result.error, undefined);
+  assert.equal(result.variables.$return, 30);
+});
+
+test("a long loop keeps running past the trace limit and reports the real output", () => {
+  const result = runProgram(`int main() { long long total = 0; for (int i = 0; i < 20000; i++) total += i; return total % 1000; }`, "");
+  assert.equal(result.error, undefined);
+  assert.match(result.notice ?? "", /first [\d,]+ steps/);
+  assert.equal(result.output.trim(), String((19999 * 20000 / 2) % 1000));
+});
+
+test("XOR-path DP over array<bool, 1024> matches the native answer", () => {
+  const source = `class Solution {
+public:
+  int minCost(vector<vector<int>>& grid) {
+    const int m = grid.size();
+    const int n = grid[0].size();
+    vector<array<bool, 1024>> dp(n);
+    array<bool, 1024> next{};
+    dp[0][grid[0][0]] = true;
+    for (int i = 0; i < m; i++) {
+      for (int j = 0; j < n; j++) {
+        if (i == 0 && j == 0) continue;
+        const int value = grid[i][j];
+        next.fill(false);
+        for (int k = 0; k < 1024; k++) {
+          if (dp[j][k] || (j > 0 && dp[j - 1][k])) next[k ^ value] = true;
+        }
+        dp[j] = next;
+      }
+    }
+    for (int k = 0; k < 1024; k++) if (dp[n - 1][k]) return k;
+    return -1;
+  }
+};`;
+  assert.equal(runProgram(source, "[[1,2],[3,4]]").output.trim(), "6");
+  assert.equal(runProgram(source, "[[5,3,7],[2,6,1],[9,4,8]]").output.trim(), "2");
 });

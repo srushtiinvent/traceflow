@@ -3,6 +3,11 @@ import { parseProgram } from "./parser";
 import type { Expr, FunctionAst, RunResult, RuntimeError, Stmt, TraceSnapshot } from "./types";
 
 const STEP_LIMIT = 5_000;
+// After the trace is full the program keeps running (without recording) so the
+// real output is still produced; this only guards against genuine runaway loops.
+const HARD_STEP_LIMIT = 500_000;
+// Keeps memory bounded when snapshots contain large arrays (e.g. array<bool, 1024>).
+const TRACE_CELL_BUDGET = 1_500_000;
 const CALL_LIMIT = 200;
 const inputStream = Symbol("cin");
 const outputStream = Symbol("cout");
@@ -41,6 +46,8 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
   const output: string[] = [];
   let error: RuntimeError | undefined;
   let stepCount = 0;
+  let traceCells = 0;
+  let traceTruncated = false;
   const functions = new Map(parsed.functions.map((fn) => [fn.name, fn]));
   const classes = new Map(parsed.classes.map((type) => [type.name, type]));
   // A standalone function can be traced directly. `main` remains the preferred
@@ -115,11 +122,26 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
   };
   const record = (line: number) => {
     stepCount += 1;
-    if (stepCount > STEP_LIMIT) throw new RuntimeFault("Possible infinite loop: execution stopped after 5,000 steps.", line);
+    if (stepCount > HARD_STEP_LIMIT) throw new RuntimeFault(`Possible infinite loop: execution stopped after ${HARD_STEP_LIMIT.toLocaleString("en-US")} steps.`, line);
+    if (traceTruncated || stepCount > STEP_LIMIT) {
+      traceTruncated = true;
+      changes.clear();
+      reads.clear();
+      return;
+    }
+    const variables = currentVariables();
+    const cells = countCells(variables) * 2;
+    if (traceCells + cells > TRACE_CELL_BUDGET && snapshots.length > 0) {
+      traceTruncated = true;
+      changes.clear();
+      reads.clear();
+      return;
+    }
+    traceCells += cells;
     snapshots.push({
       line,
       nodeId: nodeForLine(line),
-      variables: currentVariables(),
+      variables,
       frames: frames.map((frame) => frame.fn.name),
       frameVariables: frameVariables(),
       output: output.join(""),
@@ -176,6 +198,12 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
             } else value = Array.isArray(initial)
               ? initial.map((item) => coerceValue(item, arrayElementType(declaration.type)))
               : coerceValue(initial, declaration.type);
+            const fixedLength = stdArrayLength(declaration.type);
+            if (fixedLength !== undefined && Array.isArray(value)) {
+              const elementType = arrayElementType(declaration.type);
+              const given = value as unknown[];
+              value = Array.from({ length: fixedLength }, (_, index) => (index < given.length ? given[index] : defaultValue(elementType)));
+            }
             }
           }
           scope.vars.set(declaration.name, value);
@@ -548,7 +576,9 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
     reads.add(location.name);
     return location.array[location.index];
   };
-  const writeLocation = (location: Location, value: unknown) => {
+  const writeLocation = (location: Location, assigned: unknown) => {
+    // C++ copies arrays and vectors on assignment: later changes to the source must not leak into the copy.
+    const value = Array.isArray(assigned) ? clone(assigned) : assigned;
     if (location.kind === "variable") {
       location.vars.set(location.name, coerceValue(value, variableType(location)));
       changes.add(location.name);
@@ -703,6 +733,13 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
       if (Array.isArray(receiver) || typeof receiver === "string") return receiver.length === 0;
       fault("empty() requires a vector, array, or string.", line);
     }
+    if (method === "fill") {
+      if (!Array.isArray(receiver)) return fault("fill() requires an array.", line);
+      if (args.length !== 1) return fault("fill() expects one value, such as fill(false).", line);
+      for (let index = 0; index < receiver.length; index += 1) receiver[index] = clone(args[0]);
+      changes.add(nameOfValue(receiver));
+      return undefined;
+    }
     if (method === "assign") {
       if (!Array.isArray(receiver)) return fault("assign() requires a vector.", line);
       if (args.length !== 2 || typeof args[0] !== "number") {
@@ -823,7 +860,7 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
   } catch (caught) {
     if (caught instanceof RuntimeFault) {
       error = { line: caught.line, message: caught.message, nodeId: nodeForLine(caught.line) };
-      if (stepCount < STEP_LIMIT) {
+      if (!traceTruncated && stepCount < STEP_LIMIT) {
         try {
           record(caught.line);
         } catch {
@@ -839,6 +876,7 @@ export function runProgram(source: string, stdin: string, entryName?: string): R
   return {
     snapshots,
     error,
+    notice: traceTruncated && !error ? `The step-by-step trace shows the first ${snapshots.length.toLocaleString("en-US")} steps only (this program is too long to record in full). It still ran to completion, and the output above is the final result.` : undefined,
     output: output.join(""),
     variables: snapshots.at(-1)?.variables ?? {},
     unusedInput: tokens.slice(inputIndex),
@@ -925,8 +963,34 @@ function convertStructuredInput(value: unknown, type: string, line: number): unk
   return convertInput(String(value), normalized);
 }
 
+// std::array<T, N> with a literal N (e.g. array<bool, 1024>).
+function stdArrayLength(type: string): number | undefined {
+  const match = type.replace(/\bconst\b|[&*]/g, "").trim().match(/^(?:std::)?array\s*<[\s\S]+,\s*(\d+)\s*>$/);
+  return match ? Number(match[1]) : undefined;
+}
+
+function countCells(value: unknown): number {
+  if (Array.isArray(value)) {
+    let total = 1;
+    for (const item of value) total += countCells(item);
+    return total;
+  }
+  if (value && typeof value === "object") {
+    let total = 1;
+    for (const nested of Object.values(value)) total += countCells(nested);
+    return total;
+  }
+  return 1;
+}
+
 function defaultValue(type: string): unknown {
   if (type.trimEnd().endsWith("*")) return null;
+  const fixedLength = stdArrayLength(type);
+  if (fixedLength !== undefined) {
+    if (fixedLength > 100_000) throw new RuntimeFault("std::array size is limited to 100,000 elements in the visualiser.", 1);
+    const elementType = arrayElementType(type);
+    return Array.from({ length: fixedLength }, () => defaultValue(elementType));
+  }
   if (type.includes("unordered_map")) return { __container: "unordered_map", entries: [] as Array<{ key: unknown; value: unknown }> };
   if (type.includes("map")) return { __container: "map", entries: [] as Array<{ key: unknown; value: unknown }> };
   for (const container of ["priority_queue", "unordered_set", "queue", "stack", "deque", "set"]) {
@@ -965,6 +1029,11 @@ function visibleVariables(frame: Frame) {
 }
 
 function arrayElementType(type: string) {
+  const normalized = type.replace(/\bconst\b|[&*]/g, "").trim();
+  if (stdArrayLength(normalized) !== undefined) {
+    const inner = normalized.slice(normalized.indexOf("<") + 1, normalized.lastIndexOf(">"));
+    return inner.slice(0, inner.lastIndexOf(",")).trim();
+  }
   return type.includes("vector") ? type.slice(type.indexOf("<") + 1, type.lastIndexOf(">")) : type;
 }
 

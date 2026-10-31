@@ -47,6 +47,7 @@ export type RunResult = {
   output: string;
   variables: Record<string, unknown>;
   unusedInput?: string[];
+  notice?: string;
 };
 
 export type Expr =

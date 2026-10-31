@@ -1,6 +1,6 @@
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600&display=swap');
 /* Scan only our own source. Without this, Tailwind scans node_modules (huge) when the project is not inside a git repo. */
-@import 'tailwindcss' source(none);
+@import 'tailwindcss';
 @source "./**/*.{ts,tsx}";
 @source "../index.html";
 
@@ -274,3 +274,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 @media (prefers-reduced-motion: reduce) {
  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
 }
+
+/* Compile & run: hover explanation when no compiler is available (static hosting) */
+.tip-wrap { position: relative; display: inline-flex; }
+.quiet-button.is-unavailable { opacity: .7; }
+.tip-bubble { position: absolute; top: calc(100% + 10px); right: 0; z-index: 50; width: 260px; padding: 11px 13px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--text); box-shadow: var(--shadow); font-size: 12px; line-height: 1.5; text-align: left; opacity: 0; transform: translateY(-4px); pointer-events: none; transition: opacity 160ms ease, transform 160ms ease; }
+.tip-bubble strong { display: block; margin-bottom: 3px; font-size: 12px; color: var(--text); }
+.tip-bubble code { padding: 1px 5px; border-radius: 5px; background: var(--raised); font-size: 11px; }
+.tip-wrap:hover .tip-bubble, .tip-wrap:focus-within .tip-bubble { opacity: 1; transform: translateY(0); }
